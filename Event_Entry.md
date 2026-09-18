@@ -1,21 +1,21 @@
-# Event QR Participant Management System — Architecture Document
+# Event QR Participant & Volunteer Management System — Architecture Document
 
-**Scale target:** ~120 participants, ~30 volunteers, single overnight hackathon event
-**Goal:** A simple, reliable system a student team can actually build and deploy — not an over-engineered one.
+**Scale target:** ~120 participants, volunteer team with **8 volunteers having scanning-app access**, single overnight hackathon event
+**Final stack:** MongoDB Atlas (database) + Render (backend hosting) + Flutter (volunteer scanning app) + Web admin dashboard
+
+> **Assumption used throughout this doc (please confirm):** Registration is for **participants only**. Food (breakfast/lunch/dinner) and Night Entry apply to **both participants and volunteers**, since volunteers are also fed and are also inside the venue overnight, and the admin needs a combined "has everyone eaten / has everyone entered" view. If this is wrong, say so and this gets a quick edit.
 
 ---
 
 ## 1. What We Are Actually Building (Plain Explanation)
 
-Three pieces of software, all talking to **one shared backend and one shared database**:
+Three pieces of software, all talking to **one shared backend and one shared MongoDB database**:
 
-1. **Volunteer App** — a phone-friendly web page (not a native app) that volunteers open in their phone's browser. It scans QR codes using the phone camera and lets the volunteer mark an action (registration, food, night entry).
-2. **Admin Dashboard** — a website coordinators open on a laptop. Shows live counts, participant tables, and full history per participant.
-3. **Backend API + Database** — the "brain." Every scan from every volunteer phone goes here. It decides if the action is allowed, records it, and pushes the update to the admin dashboard.
+1. **Volunteer App (Flutter)** — a mobile app installed on the phones of the 8 volunteers who scan QR codes. Since it's only going to 8 known people, you don't need to publish it on the Play Store/App Store — build it, export the APK (Android) or an ad-hoc build (iOS), and share it directly (Drive link, WhatsApp, USB) with those 8 phones.
+2. **Admin Dashboard (Web)** — a website coordinators open on a laptop. Shows live counts for participants *and* volunteers, full tables, and full history per person.
+3. **Backend API + MongoDB** — the "brain." Every scan from every volunteer's Flutter app goes here. It decides if the action is allowed, records it, and pushes the update to the admin dashboard.
 
-**Why one shared backend matters:** this is the whole point of the system. No app "remembers" anything on its own — the phone is just a scanner + button. The backend is the single source of truth, so two volunteers can never accidentally give the same person lunch twice.
-
-At your scale (120 people, 30 volunteers), this is a genuinely small system. The hard technical problems (millions of rows, huge concurrent load) don't apply to you — the design below is intentionally light.
+**Why one shared backend matters:** no app "remembers" anything on its own — the phone is just a scanner + button. The backend is the single source of truth, so two volunteers can never accidentally give the same person lunch twice, and no one can be double-counted for night entry.
 
 ---
 
@@ -25,17 +25,17 @@ At your scale (120 people, 30 volunteers), this is a genuinely small system. The
 flowchart TB
     subgraph Clients
         A[Admin Dashboard<br/>Web app, laptop]
-        V[Volunteer Web App<br/>Mobile browser, camera scan]
+        V[Volunteer App<br/>Flutter, 8 phones only]
     end
 
     subgraph Backend
-        API[Backend API<br/>Node.js / FastAPI]
-        AUTH[Auth + Role Check]
+        API[Backend API<br/>Node.js + Express]
+        AUTH[Auth + Role Check<br/>only 8 volunteer logins valid]
         LOGIC[Business Rules<br/>duplicate checks, sequence checks]
     end
 
-    DB[(PostgreSQL Database<br/>Participants, Volunteers, Actions Log)]
-    RT[Realtime Updates<br/>WebSocket / Supabase Realtime]
+    DB[(MongoDB Atlas<br/>Participants, Volunteers, Actions)]
+    RT[Realtime Updates<br/>WebSocket / polling]
 
     A -->|HTTPS requests| API
     V -->|HTTPS requests| API
@@ -44,21 +44,20 @@ flowchart TB
     RT -->|live push| A
 ```
 
-**In words:** both apps are just "thin clients" — they show data and send requests. All the real decision-making (is this allowed? has it already happened?) lives in the backend, never in the app itself. This is the single most important design rule for this whole project.
+Both apps are "thin clients" — they show data and send requests. All real decision-making (is this allowed? has it already happened?) lives in the backend, never in the app itself.
 
 ---
 
 ## 3. What's On the QR Code
 
-**Rule: the QR code contains almost nothing.** It is just a random lookup key, not participant data.
+**Rule: the QR code contains almost nothing** — just a random lookup key.
 
 ```
 QR content  =  a random unique token string
-Example:    =  "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f"
+Example     =  "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f"
 ```
 
-**Why not just print the Participant ID (EVT-00125) in the QR?**
-It's simpler, but anyone could guess or recreate IDs sequentially (EVT-00001, EVT-00002...) and print a fake card. A long random token is hard to guess and costs nothing extra to implement.
+**Every person who can be scanned gets one token** — this now includes both participants (printed on their ID card) and volunteers (printed on their volunteer badge, since volunteers also get scanned for food and night entry).
 
 Flow every time a QR is scanned:
 
@@ -67,86 +66,166 @@ Scanned text (token)
       ↓
 Sent to backend: POST /scan { token }
       ↓
-Backend looks up participant by token
+Backend looks up the token in BOTH participants and volunteers
       ↓
-Backend returns: name, team, college, current status
+Backend returns: who they are, what type (participant/volunteer), current status
       ↓
-App displays participant + relevant action buttons
+App displays the person + the relevant action buttons for that screen
 ```
 
-**At registration time**, you generate this token once per participant (e.g. with a UUID library), save it in the database next to that participant's row, and print it as a QR on their ID card. That's it — no signing, no encryption needed at this scale. A long random UUID is already effectively unguessable.
+At registration/onboarding time, generate this token once per person (a UUID), save it on their document, and print it as a QR on their card/badge. No signing or encryption needed at this scale — a long random UUID is already effectively unguessable.
 
 ---
 
-## 4. Database Schema (Simple, Action-Log Based)
+## 4. Database Design (MongoDB — Collections, Not Tables)
 
-You had the right instinct in your notes: **don't just store `lunch = true/false`. Store a log of events.** Booleans lose "when" and "who." A log gives you both, and the booleans/status you need for the UI can be *derived* from the log.
+MongoDB is document-based, so instead of rigid tables we have **collections**. The same instinct from before still holds: **don't just store `lunch: true/false` on a person's document — store a log of timestamped, volunteer-attributed events**, and derive status from that log.
+
+### Collections
 
 ```mermaid
 erDiagram
     TEAMS ||--o{ PARTICIPANTS : has
     PARTICIPANTS ||--o{ ACTIONS : "has history of"
+    VOLUNTEERS ||--o{ ACTIONS : "has history of (own food/entry)"
     VOLUNTEERS ||--o{ ACTIONS : performs
 
     TEAMS {
-        int team_id PK
+        string team_id PK
         string team_name
     }
 
     PARTICIPANTS {
-        int participant_id PK
+        string participant_id PK
         string name
         string college
-        int team_id FK
+        string team_id FK
         string qr_token UK
         timestamp created_at
     }
 
     VOLUNTEERS {
-        int volunteer_id PK
+        string volunteer_id PK
+        string name
         string username
         string password_hash
-        string role
+        string qr_token UK
+        boolean app_access
         string assigned_station
+        timestamp created_at
     }
 
     ACTIONS {
-        int action_id PK
-        int participant_id FK
-        int volunteer_id FK
+        string action_id PK
+        string subject_type
+        string subject_id
         string action_type
+        string performed_by_volunteer_id FK
         timestamp created_at
     }
 ```
 
-**`action_type` values (the full list you need):**
-`ID_VERIFIED`, `REGISTRATION_COMPLETED`, `KIT_ISSUED`, `PAPER_SIGNED`, `BREAKFAST`, `LUNCH`, `DINNER`, `NIGHT_ENTRY`
-
-**The one critical database rule (this solves duplicate-prevention AND concurrency in one line):**
-
-```sql
-CREATE UNIQUE INDEX one_action_per_participant
-ON actions (participant_id, action_type);
+**`participants` collection** — one document per participant:
+```json
+{
+  "_id": "EVT-00125",
+  "name": "Rahul Kumar",
+  "college": "XYZ College",
+  "team_id": "TEAM-ALPHA",
+  "qr_token": "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f",
+  "created_at": "2026-09-18T06:00:00Z"
+}
 ```
 
-This tells PostgreSQL itself: *"this participant can never have two `LUNCH` rows."* Even if two volunteers scan the same person at the exact same millisecond, the database will accept the first insert and reject the second automatically. You don't need to write clever locking code — the database does it for you for free. This is explained more in Section 8.
+**`volunteers` collection** — one document per volunteer. `app_access` marks exactly which volunteers can log into the Flutter app (your "only 8" rule) — this lets you add more volunteers to the system later (for meal tracking etc.) without automatically giving them scanner-app logins:
+```json
+{
+  "_id": "VOL-018",
+  "name": "Aisha Verma",
+  "username": "vol018",
+  "password_hash": "•••••",
+  "qr_token": "5e2a11f0-...",
+  "app_access": true,
+  "assigned_station": "food",
+  "created_at": "2026-09-18T06:00:00Z"
+}
+```
 
-A participant's "status" (e.g., "Lunch: Given ✓") is simply: *does a `LUNCH` row exist for this participant?* You don't need a separate status table.
+**`actions` collection** — the single event log, shared by participants and volunteers, using `subject_type` to tell them apart:
+```json
+{
+  "_id": "ACT-004821",
+  "subject_type": "participant",
+  "subject_id": "EVT-00125",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:04:52Z"
+}
+```
+```json
+{
+  "_id": "ACT-004822",
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:11:09Z"
+}
+```
+
+**`action_type` values, and who they apply to:**
+
+| action_type | Applies to |
+|---|---|
+| `ID_VERIFIED` | Participants only |
+| `REGISTRATION_COMPLETED` | Participants only |
+| `KIT_ISSUED` | Participants only |
+| `PAPER_SIGNED` | Participants only |
+| `BREAKFAST` / `LUNCH` / `DINNER` | Participants **and** volunteers |
+| `NIGHT_ENTRY` | Participants **and** volunteers |
+
+### The one critical rule that prevents duplicates (MongoDB version)
+
+```js
+db.actions.createIndex(
+  { subject_type: 1, subject_id: 1, action_type: 1 },
+  { unique: true }
+)
+```
+
+This tells MongoDB: *"this exact subject (participant OR volunteer) can never have two `LUNCH` rows."* If two volunteers scan the same person for lunch at the same moment, MongoDB accepts the first insert and rejects the second with an `E11000 duplicate key` error — your backend catches that specific error and turns it into a clean "Lunch already given" message. No manual locking code needed.
+
+A person's status (e.g. "Lunch: Given ✓") is simply: *does an action document exist for `(subject_type, subject_id, 'LUNCH')`?* You don't need a separate status field to keep in sync.
 
 ---
 
-## 5. Volunteer App — Screens & Flow
+## 5. How Data Storage Size Actually Looks (MongoDB Atlas Free Tier)
+
+| Collection | Docs | Rough size each | Total |
+|---|---|---|---|
+| participants | 120 | ~0.5 KB | ~60 KB |
+| volunteers | ~10–30 | ~0.3 KB | ~10 KB |
+| teams | ~20 | ~0.2 KB | ~4 KB |
+| actions | up to (120+8) × ~7 actions ≈ 900 | ~0.3 KB | ~270 KB |
+
+**Total real data: well under 1 MB**, even generously padded for indexes it stays in the low single-digit MB. Your MongoDB Atlas **free M0 tier (512 MB)** is 100x+ more than you will ever need — it is not something to worry about for this event.
+
+---
+
+## 6. Volunteer App (Flutter) — Screens & Flow
 
 ```mermaid
 flowchart TD
-    L[Login: Volunteer ID + PIN] --> N{Bottom Nav}
+    L[Login: Volunteer ID + PIN<br/>only 8 accounts are valid] --> N{Bottom Nav}
     N --> R[Registration Tab]
     N --> F[Food Tab]
     N --> NE[Night Entry Tab]
 
     R --> RS[Tap SCAN QR]
     RS --> RC[Camera opens, scans QR]
-    RC --> RP[Participant card shown<br/>+ checklist]
+    RC --> RCheck{Token belongs to<br/>a participant?}
+    RCheck -- No, it's a volunteer --> RErr[Registration does not apply<br/>to volunteers — show message]
+    RCheck -- Yes --> RP[Participant card shown<br/>+ checklist]
     RP --> RD[Volunteer taps DONE]
     RD --> RB[Backend validates + saves]
     RB --> RSucc[Success screen] --> RS
@@ -158,129 +237,134 @@ flowchart TD
     B1 --> FS[SCAN QR]
     L1 --> FS
     D1 --> FS
-    FS --> FC[Participant shown<br/>+ GIVE MEAL button]
-    FC --> FB[Backend validates + saves]
+    FS --> FDetect{Participant or volunteer?}
+    FDetect --> FC[Person shown<br/>+ GIVE MEAL button]
+    FC --> FB[Backend validates + saves<br/>subject_type set automatically]
     FB --> FSucc[Success] --> FS
 
     NE --> NS[SCAN QR]
-    NS --> NC[Participant shown<br/>+ ENTRY button]
+    NS --> NDetect{Participant or volunteer?}
+    NDetect --> NC[Person shown<br/>+ ENTRY button]
     NC --> NB[Backend validates + saves]
     NB --> NSucc[Success] --> NS
 ```
 
-**Design principle:** after every successful action, the screen should snap straight back to "ready to scan the next person" — minimum taps, no dead ends. This matters a lot in practice because volunteers will be doing this hundreds of times in a row.
+Notice the Registration tab is the one exception that explicitly rejects volunteer QR codes — that's the one workflow that's participant-only per Section 4's table.
+
+**Login for the app:** since only 8 volunteers ever use it, keep this dead simple — a `volunteer_id` + PIN login screen, and the backend only issues a valid session if that volunteer's document has `app_access: true`.
 
 ---
 
-## 6. Backend Flow — What Happens on Every Scan (Step by Step)
+## 7. Backend Flow — What Happens on Every Scan
 
-This is the same shape for registration, food, and night entry — only the `action_type` changes.
+Same shape for every tab; only `action_type` and which collection is checked (`subject_type`) changes.
 
 ```mermaid
 flowchart TD
-    S[Volunteer app sends:<br/>token + action_type + volunteer_id] --> A{Is volunteer<br/>logged in and authorized<br/>for this action?}
+    S[App sends:<br/>token + action_type + volunteer_session] --> A{Is this one of the<br/>8 logged-in volunteers,<br/>authorized for this station?}
     A -- No --> E1[403: Not authorized]
-    A -- Yes --> B{Does token match<br/>a participant?}
-    B -- No --> E2[404: Participant not found]
-    B -- Yes --> C{Does an action row<br/>already exist for<br/>this participant + type?}
-    C -- Yes --> E3[409: Already done<br/>show who/when]
+    A -- Yes --> B{Does token match a<br/>participant OR a volunteer?}
+    B -- No --> E2[404: Not found]
+    B -- Yes --> C0{Is this action type<br/>allowed for this subject_type?<br/>e.g. REGISTRATION blocked for volunteers}
+    C0 -- No --> E5[400: This action doesn't apply here]
+    C0 -- Yes --> C{Does an action already exist for<br/>this subject_type + subject_id + action_type?}
+    C -- Yes --> E3[409: Already done — show who/when]
     C -- No --> D{Are prerequisite steps done?<br/>e.g. registration before kit}
     D -- No --> E4[400: Complete earlier step first]
-    D -- Yes --> F[INSERT new action row<br/>participant_id, volunteer_id,<br/>action_type, timestamp]
+    D -- Yes --> F[INSERT new action document]
     F --> G[Return success + updated status]
     G --> H[Realtime event fires →<br/>admin dashboard updates live]
 ```
 
-**Plain-English summary of the 6 backend checks from your notes**, mapped directly onto this diagram:
-1. Participant exists → step B
-2. QR valid → same as B (invalid token = no match)
-3. Action already completed → step C
-4. Volunteer authorized → step A
-5. Previous steps completed → step D
-6. Event currently active → an extra simple check: a single `event_settings` row with `is_active = true/false` that the admin can flip
-
 ---
 
-## 7. Admin Dashboard — Screens & Flow
+## 8. Admin Dashboard — Screens & Flow
 
 ```mermaid
 flowchart TD
     AL[Admin Login] --> D[Dashboard Home]
-    D --> OV[Live Overview Cards<br/>Total / Registered / Kits / Meals / Night Entry]
+    D --> OV[Live Overview Cards<br/>Participants: Registered / Kits / Meals / Night Entry<br/>Volunteers: Meals / Night Entry]
     D --> PT[Participant Table<br/>filter/search by team or status]
+    D --> VT[Volunteer Table<br/>meals + night entry status]
     PT --> PP[Click a participant]
-    PP --> PH[Full History Timeline<br/>every action + time + volunteer]
-    D --> VM[Volunteer Management<br/>add/disable volunteer accounts]
+    VT --> VP[Click a volunteer]
+    PP --> PH[Full History Timeline]
+    VP --> VH[Full History Timeline]
+    D --> VM[Manage Volunteers<br/>add/disable app_access for the 8 accounts]
     D --> EX[Export CSV]
     OV -.->|auto-updates live| RTX[Realtime channel]
     PT -.->|auto-updates live| RTX
+    VT -.->|auto-updates live| RTX
 ```
 
-**How the live-updating actually works (in simple terms):** the admin dashboard doesn't repeatedly ask "anything new?" every second (that's wasteful). Instead, it opens one persistent connection to the backend. Whenever any volunteer's scan is saved to the database, the backend immediately pushes that one small update down that open connection, and the dashboard re-renders just that part of the screen — the count ticks up instantly without a manual refresh.
+**Combined "has everyone eaten" view:** the overview cards show participants and volunteers as two related-but-separate counts (e.g. "Lunch — Participants: 98/120, Volunteers: 7/8") so the admin can see the full picture without the two groups' numbers blending together confusingly.
+
+**How live-updating works:** the dashboard opens one persistent connection to the backend. Whenever any scan is saved, the backend pushes that one small update down the open connection and the dashboard re-renders just that part — no manual refresh needed.
 
 ---
 
-## 8. Duplicate Prevention & Concurrency — Explained Simply
+## 9. Duplicate Prevention & Concurrency — Explained Simply
 
-**The scenario you're worried about:** two volunteers scan the same participant for lunch within the same second, both from an app that still shows "Lunch: Not Given."
+**The scenario:** two volunteers scan the same person for lunch within the same second.
 
-**The wrong way to solve it:** check "has lunch been given?" and then, a moment later, insert the record. There's a tiny gap between the check and the insert — and in that gap, both requests can slip through. This is called a "race condition."
+**The wrong way:** check "already given?" then insert a moment later — there's a small gap where both requests can slip through (a "race condition").
 
-**The right way (and it's actually simpler to build):** let the database's unique constraint from Section 4 be the single source of truth. Both requests try to `INSERT`. The database physically only allows one row to exist for `(participant_id, 'LUNCH')`. The first insert succeeds. The second one is rejected by the database itself with an error — the backend catches that specific error and turns it into a clean "Lunch already given" message. You never need custom locking logic; you're just letting Postgres do what it's built to do.
-
-At 120 participants and 30 volunteers, true simultaneous double-scans will be rare, but building it this way costs no extra effort and removes the entire problem permanently.
+**The right way:** let MongoDB's unique index (Section 4) be the single source of truth. Both requests try to insert. MongoDB physically allows only one document for `(subject_type, subject_id, action_type)`. The first insert succeeds; the second is rejected by the database itself, and the backend turns that rejection into a clean "already given" message. No custom locking code required.
 
 ---
 
-## 9. Roles & Permissions
+## 10. Roles & Permissions
 
-| Action | Admin | Volunteer |
+| Action | Admin | Volunteer (1 of the 8) |
 |---|---|---|
 | Scan & record actions | ✅ (all types) | ✅ (only for their assigned tab/station) |
-| View all participants | ✅ | ❌ (only the one they just scanned) |
+| View all participants/volunteers | ✅ | ❌ (only the one they just scanned) |
 | View full activity log / audit trail | ✅ | ❌ |
-| Add/disable volunteer accounts | ✅ | ❌ |
-| Override a duplicate action (correct a mistake) | ✅ | ❌ |
-| Edit participant details | ✅ | ❌ |
-| Delete any record | ❌ (avoid entirely, even for admin — see Section 14) | ❌ |
+| Add/disable volunteer app access | ✅ | ❌ |
+| Override a duplicate action (fix a mistake) | ✅ | ❌ |
+| Edit participant/volunteer details | ✅ | ❌ |
+| Delete any record | ❌ (avoid entirely — see Section 15) | ❌ |
 | Export data | ✅ | ❌ |
 
-Practically: a volunteer's login token just carries `role: volunteer` and `station: food` (or similar). The backend checks this on **every** request — never trust the app screen to decide what a user is "allowed" to see, since the screen can be tampered with but the backend check cannot.
+A volunteer's login session carries `role: volunteer`, `volunteer_id`, and `station`. The backend checks this on **every** request — never trust the app screen alone, since a screen can be tampered with but a backend check cannot.
 
 ---
 
-## 10. API Endpoints (What You'll Actually Build)
+## 11. API Endpoints
 
 ```
-POST   /auth/login                 → returns a session token for admin or volunteer
-POST   /scan                       → { token } → returns participant info + current status
-POST   /actions                    → { participant_id, action_type } → records one action
-GET    /participants               → admin only, full table
-GET    /participants/:id/history   → full timeline for one participant
-GET    /dashboard/summary          → live counts for the overview cards
-GET    /volunteers                 → admin only
-POST   /volunteers                 → admin only, create volunteer login
+POST   /auth/login                    → returns a session token (admin or one of the 8 volunteers)
+POST   /scan                          → { token } → returns subject_type + person info + current status
+POST   /actions                       → { subject_type, subject_id, action_type } → records one action
+GET    /participants                  → admin only, full table
+GET    /volunteers                    → admin only, full table
+GET    /participants/:id/history      → full timeline for one participant
+GET    /volunteers/:id/history        → full timeline for one volunteer
+GET    /dashboard/summary             → live counts (participants + volunteers, separated)
+POST   /volunteers                    → admin only, create a volunteer (app_access true/false)
 ```
 
-**Example: recording a lunch scan**
+**Example: recording a volunteer's own lunch**
 
 Request:
 ```json
 POST /actions
 {
-  "participant_id": "EVT-00125",
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
   "action_type": "LUNCH"
 }
 ```
-(volunteer identity comes from their login session, not the request body — this stops a volunteer from claiming to be someone else)
+(the scanning volunteer's own identity comes from their login session, not the request body)
 
 Success response:
 ```json
 {
   "status": "success",
+  "subject_type": "volunteer",
   "action_type": "LUNCH",
-  "recorded_at": "2026-09-18T13:04:52Z",
-  "volunteer": "VOL-018"
+  "recorded_at": "2026-09-18T13:11:09Z",
+  "performed_by": "VOL-018"
 }
 ```
 
@@ -290,155 +374,165 @@ Duplicate response:
   "status": "error",
   "code": "ALREADY_DONE",
   "message": "Lunch has already been given.",
-  "given_at": "2026-09-18T13:04:52Z",
+  "given_at": "2026-09-18T13:11:09Z",
   "given_by": "VOL-018"
+}
+```
+
+Wrong-action-type response (e.g. trying REGISTRATION on a volunteer):
+```json
+{
+  "status": "error",
+  "code": "ACTION_NOT_APPLICABLE",
+  "message": "Registration does not apply to volunteers."
 }
 ```
 
 ---
 
-## 11. Recommended Tech Stack (Sized for a Student Team, 120 People)
+## 12. Final Tech Stack
 
-| Layer | Recommendation | Why |
+| Layer | Choice | Why |
 |---|---|---|
-| Volunteer app | **Mobile web app (PWA)**, not a native app | Skips app-store approval entirely. Any phone camera can scan via browser using a library like `html5-qrcode`. Just share a link. |
-| Admin dashboard | React (or plain HTML/JS if the team is less experienced) | Small dataset, no need for anything heavy |
-| Backend | Node.js + Express, **or** Python + FastAPI | Whichever your team already knows best — either is more than capable at this scale |
-| Database | PostgreSQL | Matches your own notes; relational fits this data perfectly |
-| Realtime updates | Built-in Postgres change feed via a managed provider (see Section 12), or plain polling every 5–10s as a fallback | At 120 participants, even simple polling works fine — don't over-invest here |
-| Auth | Simple username+password with hashed passwords (bcrypt) and session tokens (JWT) | No need for anything more elaborate at this scale |
-
-**Important MVP framing:** a native Android/iOS app is unnecessary complexity here — a mobile browser page with camera access does everything you need and ships in a fraction of the time.
+| Volunteer app | **Flutter** (Android build shared as an APK directly to the 8 phones) | You've chosen this — since distribution is to only 8 known people, you can skip the Play Store entirely and just share the APK file |
+| Admin dashboard | React (or plain HTML/JS) | Small dataset, no need for anything heavy |
+| Backend | **Node.js + Express** (Mongoose for MongoDB) — FastAPI + PyMongo/Motor is an equally fine alternative if your team knows Python better | Simple REST API, pairs cleanly with MongoDB |
+| Database | **MongoDB Atlas (M0 free tier)** | Finalized — see Section 5 for why 512 MB is plenty |
+| Auth | Username+PIN with hashed passwords (bcrypt) and session tokens (JWT) | No need for anything more elaborate at this scale |
+| Realtime updates | WebSocket (Socket.IO) for the admin dashboard, or polling every 5–10s as a simpler fallback | Either is fine at this scale |
 
 ---
 
-## 12. Where to Host This for Free (Sized for 120 Participants / 30 Volunteers)
+## 13. Hosting: Render + Your Keep-Alive Script
 
-This scale is genuinely tiny by web standards, so every option below has a free tier that comfortably fits — the concern isn't "will it handle the load," it's "which is easiest for a student team to set up correctly." A recommended pairing:
+**Finalized choice: Render free web service** for the backend.
 
-| Piece | Free option | Notes |
-|---|---|---|
-| **Database + Backend logic** | **Supabase** (free tier) — hosted PostgreSQL, built-in auth, and built-in realtime updates | This single service can replace a hand-built backend for most of your endpoints, since it gives you a database, row-level auth rules, and live change events out of the box. Free tier easily covers a database this small. |
-| **Custom backend logic** (the validation rules, e.g. "block duplicate lunch," "check sequence") | **Supabase Edge Functions**, or a small Node/FastAPI app on **Render** (free web service tier) or **Railway** (free trial credits) | Use this for anything more custom than Supabase's default database rules cover. |
-| **Admin dashboard (website)** | **Vercel** or **Netlify** free tier | Both give free hosting + a live URL for a React/static site, with automatic deploys from GitHub. |
-| **Volunteer app (mobile web)** | Same as above — **Vercel/Netlify** free tier | It's just another web page; no separate hosting needed. |
-| **QR code generation** | Any open-source QR library (e.g. `qrcode` npm package) run locally when generating ID cards — no hosting needed | You generate these once before the event, not live. |
+Render's free tier sleeps a service after **15 minutes** of no incoming traffic, and the first request after sleeping takes 30–60 seconds to wake up. Your plan — a script that pings the backend's URL every **9 minutes** — is the right fix, and 9 minutes is safely under the 15-minute threshold with margin for network delays.
 
-**Why this combo specifically:** Supabase alone gives you Postgres + Auth + Realtime for free, which covers roughly 60–70% of the "hard parts" of this project without you writing that infrastructure yourself. That's a large amount of saved effort for a student team on a deadline. Vercel/Netlify are the standard free choices for hosting the two websites.
+**How to build the keep-alive script (two options):**
+- **Simple/free and reliable:** use a free external cron service like [cron-job.org](https://cron-job.org) or UptimeRobot to hit a lightweight `GET /health` endpoint on your backend every 9 minutes. This is more reliable than self-pinging because it runs outside Render, so it isn't affected by your own service sleeping.
+- **Self-pinging (inside your own backend):** a `setInterval` or `node-cron` job inside the Express app that calls its own `/health` route every 9 minutes. Simpler to set up, but has a chicken-and-egg risk if the service ever cold-starts from something outside your control (a deploy, a crash) — the external cron option avoids that.
 
-One caution: free tiers on services like Render can "sleep" after inactivity and take a few seconds to wake up on the first request. For a live event, do a test scan right before doors open to "wake up" the backend, or choose Supabase Edge Functions (which don't have this cold-start sleep behavior) for anything scan-critical.
+**One number worth knowing:** Render's free tier gives **750 instance-hours/month**, and a 31-day month has 744 hours. Keeping the service awake 24/7 all month fits *just* inside that limit — but it's tight. If you only need it awake during your active dev/testing days and the event itself (not the full month), turn the keep-alive off outside those windows so you have hours to spare rather than running right at the edge.
+
+Add a simple `/health` endpoint that just returns `{ status: "ok" }` — this is what the keep-alive pings hit, and it avoids putting load on your real database-touching endpoints just to stay awake.
 
 ---
 
-## 13. MVP vs. Later vs. Skip Entirely
+## 14. MVP vs. Later vs. Skip Entirely
 
 | Feature | MVP (build first) | Add if time allows | Skip — unnecessary here |
 |---|---|---|---|
-| QR scan + participant lookup | ✅ | | |
-| Registration checklist + backend validation | ✅ | | |
-| Food (breakfast/lunch/dinner) with duplicate prevention | ✅ | | |
-| Night entry tracking | ✅ | | |
-| Admin overview counts | ✅ | | |
-| Admin participant table + individual history | ✅ | | |
-| Role-based login (admin vs volunteer) | ✅ | | |
-| Live-updating dashboard (realtime push) | | ✅ (polling every 5–10s is a fine MVP substitute) | |
+| QR scan + participant/volunteer lookup | ✅ | | |
+| Registration checklist (participants only) + backend validation | ✅ | | |
+| Food (breakfast/lunch/dinner) for participants **and** volunteers, duplicate-proof | ✅ | | |
+| Night entry for participants **and** volunteers | ✅ | | |
+| Admin overview counts, split by participant/volunteer | ✅ | | |
+| Admin tables + individual history | ✅ | | |
+| Role-based login (admin vs. 8 volunteer accounts) | ✅ | | |
+| Render keep-alive script | ✅ | | |
+| Live-updating dashboard (realtime push) | | ✅ (5–10s polling is a fine MVP substitute) | |
 | CSV export | | ✅ | |
 | Admin "override" for correcting mistaken duplicates | | ✅ | |
-| Offline mode with later sync | | | ❌ — adds serious complexity (conflict resolution) for a single-venue, likely-WiFi-covered event |
-| QR signing / cryptographic verification | | | ❌ — a long random token is already sufficient at this scale |
-| Native mobile app | | | ❌ — mobile web page is strictly simpler and faster to ship |
-| Microservices / multiple backend services | | | ❌ — one small backend service is all you need |
-| Horizontal auto-scaling infrastructure | | | ❌ — 30 volunteers scanning is nowhere near a load concern |
+| Offline mode with later sync | | | ❌ — adds real complexity for a single-venue event |
+| QR signing / cryptographic verification | | | ❌ — random UUID token is sufficient here |
+| Publishing the Flutter app to Play Store | | | ❌ — unnecessary for 8 known phones, just share the APK |
+| Microservices | | | ❌ — one backend service is all you need |
 
 ---
 
-## 14. Edge Cases Worth Planning For
+## 15. Edge Cases Worth Planning For
 
-- **Volunteer needs to undo a mistaken scan** (wrong person, fat-fingered button): don't allow `DELETE` on action rows even for admins — instead, add an `is_voided` flag admins can set, so the audit trail is never actually erased, just marked invalid.
-- **QR code physically damaged/unreadable**: give volunteers a manual fallback — a small search-by-name/ID box for the rare case where a card won't scan.
-- **Participant loses ID card**: admin panel should let an admin look up a participant and re-print/reissue the same QR token (don't generate a new one, or their history would split across two tokens).
-- **Volunteer's phone loses signal mid-event**: show a clear "connection lost, please retry" message rather than a silent failure — don't let the app pretend an action succeeded when it didn't reach the backend.
-- **Two people with visually similar names**: always confirm the Participant ID and photo (if you include one) on screen before letting the volunteer hit the action button, not just the name.
-- **Event runs late / activity needed outside "normal" hours**: don't hardcode a time window — rely on the simple `is_active` flag mentioned in Section 6 instead.
+- **Volunteer needs to undo a mistaken scan:** don't allow `DELETE` on action documents even for admins — add an `is_voided` flag instead, so the audit trail is never erased, only marked invalid.
+- **QR code damaged/unreadable:** give volunteers a manual fallback — a search-by-name/ID box in the app for when a card won't scan.
+- **Volunteer's own badge is lost:** admin should be able to look up that volunteer and reissue their existing token (don't generate a new one, or their history splits across two tokens).
+- **A volunteer without `app_access` accidentally tries to log in:** backend should reject clearly ("this account does not have scanner access") rather than silently failing.
+- **Phone loses signal mid-event:** show a clear "connection lost, please retry" message — never let the app pretend an action succeeded when it didn't reach the backend.
+- **Registration accidentally attempted on a volunteer's badge:** backend rejects it with the `ACTION_NOT_APPLICABLE` response from Section 11 — this needs to be one of your very first tests.
+- **Render cold start right as the event starts:** send a manual warm-up ping ~10 minutes before doors open, even with the 9-minute keep-alive running, as a safety margin.
 
 ---
 
-## 15. Suggested Folder Structure
+## 16. Suggested Folder Structure
 
 ```
 backend/
   src/
-    routes/        (auth.js, scan.js, actions.js, dashboard.js, volunteers.js)
-    controllers/    (business logic for each route)
-    middleware/     (auth check, role check)
-    db/             (connection + queries)
+    routes/         (auth.js, scan.js, actions.js, dashboard.js, volunteers.js, health.js)
+    controllers/     (business logic for each route)
+    middleware/      (auth check, role check, subject-type/action-type validity check)
+    models/          (Mongoose schemas: Participant, Volunteer, Action, Team)
+    db/              (MongoDB connection)
   package.json
 
 admin-dashboard/
   src/
-    pages/          (Login, Overview, ParticipantTable, ParticipantHistory, Volunteers)
-    components/     (StatCard, Table, Timeline)
-    api/            (calls to backend)
+    pages/           (Login, Overview, ParticipantTable, VolunteerTable, History, ManageVolunteers)
+    components/       (StatCard, Table, Timeline)
+    api/              (calls to backend)
 
-volunteer-app/
-  src/
-    pages/          (Login, Registration, Food, NightEntry)
-    components/      (QRScanner, ParticipantCard, ActionButton)
-    api/
+volunteer-app-flutter/
+  lib/
+    screens/          (login_screen.dart, registration_screen.dart, food_screen.dart, night_entry_screen.dart)
+    widgets/           (qr_scanner.dart, person_card.dart, action_button.dart)
+    services/          (api_service.dart)
 ```
 
 ---
 
-## 16. Deployment Architecture (Putting It All Together)
+## 17. Deployment Architecture
 
 ```mermaid
 flowchart LR
     subgraph Internet
-        U1[Volunteer phones]
+        U1[8 Volunteer phones<br/>Flutter app]
         U2[Admin laptop]
+        CRON[Free external cron<br/>pings every 9 min]
     end
 
-    U1 -->|HTTPS| VApp[Volunteer App<br/>hosted on Vercel/Netlify]
-    U2 -->|HTTPS| AApp[Admin Dashboard<br/>hosted on Vercel/Netlify]
+    U1 -->|HTTPS| BE[Backend API<br/>Render free web service]
+    U2 -->|HTTPS| AApp[Admin Dashboard<br/>hosted on Render/Vercel/Netlify]
+    CRON -->|GET /health every 9 min| BE
 
-    VApp -->|API calls| BE[Backend API<br/>Supabase Edge Functions<br/>or Render free tier]
     AApp -->|API calls| BE
-    BE --> DB[(Supabase PostgreSQL)]
+    BE --> DB[(MongoDB Atlas M0)]
     DB -.->|realtime events| AApp
 ```
 
 ---
 
-## 17. Testing Strategy (Kept Realistic for a Student Team)
+## 18. Testing Strategy
 
-- **Before the event, with fake data:** create ~10 dummy participants, simulate the full journey (registration → kit → all meals → night entry) for each, and specifically try to double-scan the same action to confirm the duplicate-prevention actually blocks it.
-- **Load check:** even a rough manual test — have 5–6 phones scan in quick succession — is enough at this scale; you don't need a formal load-testing tool.
-- **Dry run night-before:** have real volunteers use the real app on real phones for a 15-minute rehearsal with a handful of test QR cards. This catches UI/scanning friction issues that are easy to miss testing alone.
-- **Have a manual fallback ready:** a simple paper backup sheet for each station, just in case the network goes down entirely during the event — the system should reduce manual work, not become a single point of failure for the whole event.
+- **Before the event, with fake data:** create ~10 dummy participants and 2–3 dummy volunteers, simulate the full journey for each, and specifically try to double-scan the same action to confirm the duplicate index actually blocks it.
+- **Test the participant/volunteer split explicitly:** try scanning a volunteer's QR on the Registration tab and confirm you get the "doesn't apply" error, not a crash.
+- **Test the 8-account limit:** try logging in with a volunteer account that has `app_access: false` and confirm it's rejected.
+- **Keep-alive check:** leave the backend idle for 20+ minutes and confirm the cron ping is actually preventing the sleep (check Render's logs).
+- **Dry run night-before:** real volunteers, real phones, real Flutter app, a handful of test QR badges for 15 minutes — this catches UI/scanning friction you won't find testing alone.
+- **Manual fallback ready:** a simple paper backup sheet per station in case the network goes down entirely during the event.
 
 ---
 
-## 18. One-Paragraph Summary
+## 19. One-Paragraph Summary
 
-Every participant gets one QR code containing a random token. Volunteers use a simple mobile web page to scan it, which asks the backend "who is this and what's their status?" — the backend is the only place that knows the rules (don't double-give lunch, don't give a kit before registration), and it records every single action as its own timestamped, volunteer-attributed row rather than just flipping a `true/false`. The admin dashboard reads from that same live data and updates automatically. At 120 participants and 30 volunteers, this whole system comfortably fits on free hosting tiers (Supabase + Vercel/Netlify), and the biggest risk to avoid is over-building — a native app, offline sync, and cryptographic QR signing are all unnecessary complexity for an event this size.
-# Event QR Participant Management System — Architecture Document
+Every participant and every one of the 8 app-enabled volunteers gets a QR code with a random token. The Flutter app scans it and asks the backend "who is this, and what's their status?" — the backend is the only place that knows the rules (registration is participant-only; food and night entry apply to both participants and volunteers; nothing can be recorded twice), and it stores every action as its own timestamped, volunteer-attributed MongoDB document rather than a simple true/false flag. The admin web dashboard reads that same live data and updates automatically, showing participants and volunteers as clearly separated but simultaneously visible counts. The whole system runs on MongoDB Atlas's free tier (which is drastically oversized for this data) and Render's free tier (kept awake by your 9-minute keep-alive ping), with zero App Store/Play Store overhead since the Flutter app only ever needs to reach 8 phones.
+# Event QR Participant & Volunteer Management System — Architecture Document
 
-**Scale target:** ~120 participants, ~30 volunteers, single overnight hackathon event
-**Goal:** A simple, reliable system a student team can actually build and deploy — not an over-engineered one.
+**Scale target:** ~120 participants, volunteer team with **8 volunteers having scanning-app access**, single overnight hackathon event
+**Final stack:** MongoDB Atlas (database) + Render (backend hosting) + Flutter (volunteer scanning app) + Web admin dashboard
+
+> **Assumption used throughout this doc (please confirm):** Registration is for **participants only**. Food (breakfast/lunch/dinner) and Night Entry apply to **both participants and volunteers**, since volunteers are also fed and are also inside the venue overnight, and the admin needs a combined "has everyone eaten / has everyone entered" view. If this is wrong, say so and this gets a quick edit.
 
 ---
 
 ## 1. What We Are Actually Building (Plain Explanation)
 
-Three pieces of software, all talking to **one shared backend and one shared database**:
+Three pieces of software, all talking to **one shared backend and one shared MongoDB database**:
 
-1. **Volunteer App** — a phone-friendly web page (not a native app) that volunteers open in their phone's browser. It scans QR codes using the phone camera and lets the volunteer mark an action (registration, food, night entry).
-2. **Admin Dashboard** — a website coordinators open on a laptop. Shows live counts, participant tables, and full history per participant.
-3. **Backend API + Database** — the "brain." Every scan from every volunteer phone goes here. It decides if the action is allowed, records it, and pushes the update to the admin dashboard.
+1. **Volunteer App (Flutter)** — a mobile app installed on the phones of the 8 volunteers who scan QR codes. Since it's only going to 8 known people, you don't need to publish it on the Play Store/App Store — build it, export the APK (Android) or an ad-hoc build (iOS), and share it directly (Drive link, WhatsApp, USB) with those 8 phones.
+2. **Admin Dashboard (Web)** — a website coordinators open on a laptop. Shows live counts for participants *and* volunteers, full tables, and full history per person.
+3. **Backend API + MongoDB** — the "brain." Every scan from every volunteer's Flutter app goes here. It decides if the action is allowed, records it, and pushes the update to the admin dashboard.
 
-**Why one shared backend matters:** this is the whole point of the system. No app "remembers" anything on its own — the phone is just a scanner + button. The backend is the single source of truth, so two volunteers can never accidentally give the same person lunch twice.
-
-At your scale (120 people, 30 volunteers), this is a genuinely small system. The hard technical problems (millions of rows, huge concurrent load) don't apply to you — the design below is intentionally light.
+**Why one shared backend matters:** no app "remembers" anything on its own — the phone is just a scanner + button. The backend is the single source of truth, so two volunteers can never accidentally give the same person lunch twice, and no one can be double-counted for night entry.
 
 ---
 
@@ -448,17 +542,17 @@ At your scale (120 people, 30 volunteers), this is a genuinely small system. The
 flowchart TB
     subgraph Clients
         A[Admin Dashboard<br/>Web app, laptop]
-        V[Volunteer Web App<br/>Mobile browser, camera scan]
+        V[Volunteer App<br/>Flutter, 8 phones only]
     end
 
     subgraph Backend
-        API[Backend API<br/>Node.js / FastAPI]
-        AUTH[Auth + Role Check]
+        API[Backend API<br/>Node.js + Express]
+        AUTH[Auth + Role Check<br/>only 8 volunteer logins valid]
         LOGIC[Business Rules<br/>duplicate checks, sequence checks]
     end
 
-    DB[(PostgreSQL Database<br/>Participants, Volunteers, Actions Log)]
-    RT[Realtime Updates<br/>WebSocket / Supabase Realtime]
+    DB[(MongoDB Atlas<br/>Participants, Volunteers, Actions)]
+    RT[Realtime Updates<br/>WebSocket / polling]
 
     A -->|HTTPS requests| API
     V -->|HTTPS requests| API
@@ -467,21 +561,20 @@ flowchart TB
     RT -->|live push| A
 ```
 
-**In words:** both apps are just "thin clients" — they show data and send requests. All the real decision-making (is this allowed? has it already happened?) lives in the backend, never in the app itself. This is the single most important design rule for this whole project.
+Both apps are "thin clients" — they show data and send requests. All real decision-making (is this allowed? has it already happened?) lives in the backend, never in the app itself.
 
 ---
 
 ## 3. What's On the QR Code
 
-**Rule: the QR code contains almost nothing.** It is just a random lookup key, not participant data.
+**Rule: the QR code contains almost nothing** — just a random lookup key.
 
 ```
 QR content  =  a random unique token string
-Example:    =  "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f"
+Example     =  "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f"
 ```
 
-**Why not just print the Participant ID (EVT-00125) in the QR?**
-It's simpler, but anyone could guess or recreate IDs sequentially (EVT-00001, EVT-00002...) and print a fake card. A long random token is hard to guess and costs nothing extra to implement.
+**Every person who can be scanned gets one token** — this now includes both participants (printed on their ID card) and volunteers (printed on their volunteer badge, since volunteers also get scanned for food and night entry).
 
 Flow every time a QR is scanned:
 
@@ -490,86 +583,166 @@ Scanned text (token)
       ↓
 Sent to backend: POST /scan { token }
       ↓
-Backend looks up participant by token
+Backend looks up the token in BOTH participants and volunteers
       ↓
-Backend returns: name, team, college, current status
+Backend returns: who they are, what type (participant/volunteer), current status
       ↓
-App displays participant + relevant action buttons
+App displays the person + the relevant action buttons for that screen
 ```
 
-**At registration time**, you generate this token once per participant (e.g. with a UUID library), save it in the database next to that participant's row, and print it as a QR on their ID card. That's it — no signing, no encryption needed at this scale. A long random UUID is already effectively unguessable.
+At registration/onboarding time, generate this token once per person (a UUID), save it on their document, and print it as a QR on their card/badge. No signing or encryption needed at this scale — a long random UUID is already effectively unguessable.
 
 ---
 
-## 4. Database Schema (Simple, Action-Log Based)
+## 4. Database Design (MongoDB — Collections, Not Tables)
 
-You had the right instinct in your notes: **don't just store `lunch = true/false`. Store a log of events.** Booleans lose "when" and "who." A log gives you both, and the booleans/status you need for the UI can be *derived* from the log.
+MongoDB is document-based, so instead of rigid tables we have **collections**. The same instinct from before still holds: **don't just store `lunch: true/false` on a person's document — store a log of timestamped, volunteer-attributed events**, and derive status from that log.
+
+### Collections
 
 ```mermaid
 erDiagram
     TEAMS ||--o{ PARTICIPANTS : has
     PARTICIPANTS ||--o{ ACTIONS : "has history of"
+    VOLUNTEERS ||--o{ ACTIONS : "has history of (own food/entry)"
     VOLUNTEERS ||--o{ ACTIONS : performs
 
     TEAMS {
-        int team_id PK
+        string team_id PK
         string team_name
     }
 
     PARTICIPANTS {
-        int participant_id PK
+        string participant_id PK
         string name
         string college
-        int team_id FK
+        string team_id FK
         string qr_token UK
         timestamp created_at
     }
 
     VOLUNTEERS {
-        int volunteer_id PK
+        string volunteer_id PK
+        string name
         string username
         string password_hash
-        string role
+        string qr_token UK
+        boolean app_access
         string assigned_station
+        timestamp created_at
     }
 
     ACTIONS {
-        int action_id PK
-        int participant_id FK
-        int volunteer_id FK
+        string action_id PK
+        string subject_type
+        string subject_id
         string action_type
+        string performed_by_volunteer_id FK
         timestamp created_at
     }
 ```
 
-**`action_type` values (the full list you need):**
-`ID_VERIFIED`, `REGISTRATION_COMPLETED`, `KIT_ISSUED`, `PAPER_SIGNED`, `BREAKFAST`, `LUNCH`, `DINNER`, `NIGHT_ENTRY`
-
-**The one critical database rule (this solves duplicate-prevention AND concurrency in one line):**
-
-```sql
-CREATE UNIQUE INDEX one_action_per_participant
-ON actions (participant_id, action_type);
+**`participants` collection** — one document per participant:
+```json
+{
+  "_id": "EVT-00125",
+  "name": "Rahul Kumar",
+  "college": "XYZ College",
+  "team_id": "TEAM-ALPHA",
+  "qr_token": "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f",
+  "created_at": "2026-09-18T06:00:00Z"
+}
 ```
 
-This tells PostgreSQL itself: *"this participant can never have two `LUNCH` rows."* Even if two volunteers scan the same person at the exact same millisecond, the database will accept the first insert and reject the second automatically. You don't need to write clever locking code — the database does it for you for free. This is explained more in Section 8.
+**`volunteers` collection** — one document per volunteer. `app_access` marks exactly which volunteers can log into the Flutter app (your "only 8" rule) — this lets you add more volunteers to the system later (for meal tracking etc.) without automatically giving them scanner-app logins:
+```json
+{
+  "_id": "VOL-018",
+  "name": "Aisha Verma",
+  "username": "vol018",
+  "password_hash": "•••••",
+  "qr_token": "5e2a11f0-...",
+  "app_access": true,
+  "assigned_station": "food",
+  "created_at": "2026-09-18T06:00:00Z"
+}
+```
 
-A participant's "status" (e.g., "Lunch: Given ✓") is simply: *does a `LUNCH` row exist for this participant?* You don't need a separate status table.
+**`actions` collection** — the single event log, shared by participants and volunteers, using `subject_type` to tell them apart:
+```json
+{
+  "_id": "ACT-004821",
+  "subject_type": "participant",
+  "subject_id": "EVT-00125",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:04:52Z"
+}
+```
+```json
+{
+  "_id": "ACT-004822",
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:11:09Z"
+}
+```
+
+**`action_type` values, and who they apply to:**
+
+| action_type | Applies to |
+|---|---|
+| `ID_VERIFIED` | Participants only |
+| `REGISTRATION_COMPLETED` | Participants only |
+| `KIT_ISSUED` | Participants only |
+| `PAPER_SIGNED` | Participants only |
+| `BREAKFAST` / `LUNCH` / `DINNER` | Participants **and** volunteers |
+| `NIGHT_ENTRY` | Participants **and** volunteers |
+
+### The one critical rule that prevents duplicates (MongoDB version)
+
+```js
+db.actions.createIndex(
+  { subject_type: 1, subject_id: 1, action_type: 1 },
+  { unique: true }
+)
+```
+
+This tells MongoDB: *"this exact subject (participant OR volunteer) can never have two `LUNCH` rows."* If two volunteers scan the same person for lunch at the same moment, MongoDB accepts the first insert and rejects the second with an `E11000 duplicate key` error — your backend catches that specific error and turns it into a clean "Lunch already given" message. No manual locking code needed.
+
+A person's status (e.g. "Lunch: Given ✓") is simply: *does an action document exist for `(subject_type, subject_id, 'LUNCH')`?* You don't need a separate status field to keep in sync.
 
 ---
 
-## 5. Volunteer App — Screens & Flow
+## 5. How Data Storage Size Actually Looks (MongoDB Atlas Free Tier)
+
+| Collection | Docs | Rough size each | Total |
+|---|---|---|---|
+| participants | 120 | ~0.5 KB | ~60 KB |
+| volunteers | ~10–30 | ~0.3 KB | ~10 KB |
+| teams | ~20 | ~0.2 KB | ~4 KB |
+| actions | up to (120+8) × ~7 actions ≈ 900 | ~0.3 KB | ~270 KB |
+
+**Total real data: well under 1 MB**, even generously padded for indexes it stays in the low single-digit MB. Your MongoDB Atlas **free M0 tier (512 MB)** is 100x+ more than you will ever need — it is not something to worry about for this event.
+
+---
+
+## 6. Volunteer App (Flutter) — Screens & Flow
 
 ```mermaid
 flowchart TD
-    L[Login: Volunteer ID + PIN] --> N{Bottom Nav}
+    L[Login: Volunteer ID + PIN<br/>only 8 accounts are valid] --> N{Bottom Nav}
     N --> R[Registration Tab]
     N --> F[Food Tab]
     N --> NE[Night Entry Tab]
 
     R --> RS[Tap SCAN QR]
     RS --> RC[Camera opens, scans QR]
-    RC --> RP[Participant card shown<br/>+ checklist]
+    RC --> RCheck{Token belongs to<br/>a participant?}
+    RCheck -- No, it's a volunteer --> RErr[Registration does not apply<br/>to volunteers — show message]
+    RCheck -- Yes --> RP[Participant card shown<br/>+ checklist]
     RP --> RD[Volunteer taps DONE]
     RD --> RB[Backend validates + saves]
     RB --> RSucc[Success screen] --> RS
@@ -581,129 +754,134 @@ flowchart TD
     B1 --> FS[SCAN QR]
     L1 --> FS
     D1 --> FS
-    FS --> FC[Participant shown<br/>+ GIVE MEAL button]
-    FC --> FB[Backend validates + saves]
+    FS --> FDetect{Participant or volunteer?}
+    FDetect --> FC[Person shown<br/>+ GIVE MEAL button]
+    FC --> FB[Backend validates + saves<br/>subject_type set automatically]
     FB --> FSucc[Success] --> FS
 
     NE --> NS[SCAN QR]
-    NS --> NC[Participant shown<br/>+ ENTRY button]
+    NS --> NDetect{Participant or volunteer?}
+    NDetect --> NC[Person shown<br/>+ ENTRY button]
     NC --> NB[Backend validates + saves]
     NB --> NSucc[Success] --> NS
 ```
 
-**Design principle:** after every successful action, the screen should snap straight back to "ready to scan the next person" — minimum taps, no dead ends. This matters a lot in practice because volunteers will be doing this hundreds of times in a row.
+Notice the Registration tab is the one exception that explicitly rejects volunteer QR codes — that's the one workflow that's participant-only per Section 4's table.
+
+**Login for the app:** since only 8 volunteers ever use it, keep this dead simple — a `volunteer_id` + PIN login screen, and the backend only issues a valid session if that volunteer's document has `app_access: true`.
 
 ---
 
-## 6. Backend Flow — What Happens on Every Scan (Step by Step)
+## 7. Backend Flow — What Happens on Every Scan
 
-This is the same shape for registration, food, and night entry — only the `action_type` changes.
+Same shape for every tab; only `action_type` and which collection is checked (`subject_type`) changes.
 
 ```mermaid
 flowchart TD
-    S[Volunteer app sends:<br/>token + action_type + volunteer_id] --> A{Is volunteer<br/>logged in and authorized<br/>for this action?}
+    S[App sends:<br/>token + action_type + volunteer_session] --> A{Is this one of the<br/>8 logged-in volunteers,<br/>authorized for this station?}
     A -- No --> E1[403: Not authorized]
-    A -- Yes --> B{Does token match<br/>a participant?}
-    B -- No --> E2[404: Participant not found]
-    B -- Yes --> C{Does an action row<br/>already exist for<br/>this participant + type?}
-    C -- Yes --> E3[409: Already done<br/>show who/when]
+    A -- Yes --> B{Does token match a<br/>participant OR a volunteer?}
+    B -- No --> E2[404: Not found]
+    B -- Yes --> C0{Is this action type<br/>allowed for this subject_type?<br/>e.g. REGISTRATION blocked for volunteers}
+    C0 -- No --> E5[400: This action doesn't apply here]
+    C0 -- Yes --> C{Does an action already exist for<br/>this subject_type + subject_id + action_type?}
+    C -- Yes --> E3[409: Already done — show who/when]
     C -- No --> D{Are prerequisite steps done?<br/>e.g. registration before kit}
     D -- No --> E4[400: Complete earlier step first]
-    D -- Yes --> F[INSERT new action row<br/>participant_id, volunteer_id,<br/>action_type, timestamp]
+    D -- Yes --> F[INSERT new action document]
     F --> G[Return success + updated status]
     G --> H[Realtime event fires →<br/>admin dashboard updates live]
 ```
 
-**Plain-English summary of the 6 backend checks from your notes**, mapped directly onto this diagram:
-1. Participant exists → step B
-2. QR valid → same as B (invalid token = no match)
-3. Action already completed → step C
-4. Volunteer authorized → step A
-5. Previous steps completed → step D
-6. Event currently active → an extra simple check: a single `event_settings` row with `is_active = true/false` that the admin can flip
-
 ---
 
-## 7. Admin Dashboard — Screens & Flow
+## 8. Admin Dashboard — Screens & Flow
 
 ```mermaid
 flowchart TD
     AL[Admin Login] --> D[Dashboard Home]
-    D --> OV[Live Overview Cards<br/>Total / Registered / Kits / Meals / Night Entry]
+    D --> OV[Live Overview Cards<br/>Participants: Registered / Kits / Meals / Night Entry<br/>Volunteers: Meals / Night Entry]
     D --> PT[Participant Table<br/>filter/search by team or status]
+    D --> VT[Volunteer Table<br/>meals + night entry status]
     PT --> PP[Click a participant]
-    PP --> PH[Full History Timeline<br/>every action + time + volunteer]
-    D --> VM[Volunteer Management<br/>add/disable volunteer accounts]
+    VT --> VP[Click a volunteer]
+    PP --> PH[Full History Timeline]
+    VP --> VH[Full History Timeline]
+    D --> VM[Manage Volunteers<br/>add/disable app_access for the 8 accounts]
     D --> EX[Export CSV]
     OV -.->|auto-updates live| RTX[Realtime channel]
     PT -.->|auto-updates live| RTX
+    VT -.->|auto-updates live| RTX
 ```
 
-**How the live-updating actually works (in simple terms):** the admin dashboard doesn't repeatedly ask "anything new?" every second (that's wasteful). Instead, it opens one persistent connection to the backend. Whenever any volunteer's scan is saved to the database, the backend immediately pushes that one small update down that open connection, and the dashboard re-renders just that part of the screen — the count ticks up instantly without a manual refresh.
+**Combined "has everyone eaten" view:** the overview cards show participants and volunteers as two related-but-separate counts (e.g. "Lunch — Participants: 98/120, Volunteers: 7/8") so the admin can see the full picture without the two groups' numbers blending together confusingly.
+
+**How live-updating works:** the dashboard opens one persistent connection to the backend. Whenever any scan is saved, the backend pushes that one small update down the open connection and the dashboard re-renders just that part — no manual refresh needed.
 
 ---
 
-## 8. Duplicate Prevention & Concurrency — Explained Simply
+## 9. Duplicate Prevention & Concurrency — Explained Simply
 
-**The scenario you're worried about:** two volunteers scan the same participant for lunch within the same second, both from an app that still shows "Lunch: Not Given."
+**The scenario:** two volunteers scan the same person for lunch within the same second.
 
-**The wrong way to solve it:** check "has lunch been given?" and then, a moment later, insert the record. There's a tiny gap between the check and the insert — and in that gap, both requests can slip through. This is called a "race condition."
+**The wrong way:** check "already given?" then insert a moment later — there's a small gap where both requests can slip through (a "race condition").
 
-**The right way (and it's actually simpler to build):** let the database's unique constraint from Section 4 be the single source of truth. Both requests try to `INSERT`. The database physically only allows one row to exist for `(participant_id, 'LUNCH')`. The first insert succeeds. The second one is rejected by the database itself with an error — the backend catches that specific error and turns it into a clean "Lunch already given" message. You never need custom locking logic; you're just letting Postgres do what it's built to do.
-
-At 120 participants and 30 volunteers, true simultaneous double-scans will be rare, but building it this way costs no extra effort and removes the entire problem permanently.
+**The right way:** let MongoDB's unique index (Section 4) be the single source of truth. Both requests try to insert. MongoDB physically allows only one document for `(subject_type, subject_id, action_type)`. The first insert succeeds; the second is rejected by the database itself, and the backend turns that rejection into a clean "already given" message. No custom locking code required.
 
 ---
 
-## 9. Roles & Permissions
+## 10. Roles & Permissions
 
-| Action | Admin | Volunteer |
+| Action | Admin | Volunteer (1 of the 8) |
 |---|---|---|
 | Scan & record actions | ✅ (all types) | ✅ (only for their assigned tab/station) |
-| View all participants | ✅ | ❌ (only the one they just scanned) |
+| View all participants/volunteers | ✅ | ❌ (only the one they just scanned) |
 | View full activity log / audit trail | ✅ | ❌ |
-| Add/disable volunteer accounts | ✅ | ❌ |
-| Override a duplicate action (correct a mistake) | ✅ | ❌ |
-| Edit participant details | ✅ | ❌ |
-| Delete any record | ❌ (avoid entirely, even for admin — see Section 14) | ❌ |
+| Add/disable volunteer app access | ✅ | ❌ |
+| Override a duplicate action (fix a mistake) | ✅ | ❌ |
+| Edit participant/volunteer details | ✅ | ❌ |
+| Delete any record | ❌ (avoid entirely — see Section 15) | ❌ |
 | Export data | ✅ | ❌ |
 
-Practically: a volunteer's login token just carries `role: volunteer` and `station: food` (or similar). The backend checks this on **every** request — never trust the app screen to decide what a user is "allowed" to see, since the screen can be tampered with but the backend check cannot.
+A volunteer's login session carries `role: volunteer`, `volunteer_id`, and `station`. The backend checks this on **every** request — never trust the app screen alone, since a screen can be tampered with but a backend check cannot.
 
 ---
 
-## 10. API Endpoints (What You'll Actually Build)
+## 11. API Endpoints
 
 ```
-POST   /auth/login                 → returns a session token for admin or volunteer
-POST   /scan                       → { token } → returns participant info + current status
-POST   /actions                    → { participant_id, action_type } → records one action
-GET    /participants               → admin only, full table
-GET    /participants/:id/history   → full timeline for one participant
-GET    /dashboard/summary          → live counts for the overview cards
-GET    /volunteers                 → admin only
-POST   /volunteers                 → admin only, create volunteer login
+POST   /auth/login                    → returns a session token (admin or one of the 8 volunteers)
+POST   /scan                          → { token } → returns subject_type + person info + current status
+POST   /actions                       → { subject_type, subject_id, action_type } → records one action
+GET    /participants                  → admin only, full table
+GET    /volunteers                    → admin only, full table
+GET    /participants/:id/history      → full timeline for one participant
+GET    /volunteers/:id/history        → full timeline for one volunteer
+GET    /dashboard/summary             → live counts (participants + volunteers, separated)
+POST   /volunteers                    → admin only, create a volunteer (app_access true/false)
 ```
 
-**Example: recording a lunch scan**
+**Example: recording a volunteer's own lunch**
 
 Request:
 ```json
 POST /actions
 {
-  "participant_id": "EVT-00125",
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
   "action_type": "LUNCH"
 }
 ```
-(volunteer identity comes from their login session, not the request body — this stops a volunteer from claiming to be someone else)
+(the scanning volunteer's own identity comes from their login session, not the request body)
 
 Success response:
 ```json
 {
   "status": "success",
+  "subject_type": "volunteer",
   "action_type": "LUNCH",
-  "recorded_at": "2026-09-18T13:04:52Z",
-  "volunteer": "VOL-018"
+  "recorded_at": "2026-09-18T13:11:09Z",
+  "performed_by": "VOL-018"
 }
 ```
 
@@ -713,286 +891,263 @@ Duplicate response:
   "status": "error",
   "code": "ALREADY_DONE",
   "message": "Lunch has already been given.",
-  "given_at": "2026-09-18T13:04:52Z",
+  "given_at": "2026-09-18T13:11:09Z",
   "given_by": "VOL-018"
+}
+```
+
+Wrong-action-type response (e.g. trying REGISTRATION on a volunteer):
+```json
+{
+  "status": "error",
+  "code": "ACTION_NOT_APPLICABLE",
+  "message": "Registration does not apply to volunteers."
 }
 ```
 
 ---
 
-## 11. Recommended Tech Stack (Sized for a Student Team, 120 People)
+## 12. Final Tech Stack
 
-| Layer | Recommendation | Why |
+| Layer | Choice | Why |
 |---|---|---|
-| Volunteer app | **Mobile web app (PWA)**, not a native app | Skips app-store approval entirely. Any phone camera can scan via browser using a library like `html5-qrcode`. Just share a link. |
-| Admin dashboard | React (or plain HTML/JS if the team is less experienced) | Small dataset, no need for anything heavy |
-| Backend | Node.js + Express, **or** Python + FastAPI | Whichever your team already knows best — either is more than capable at this scale |
-| Database | PostgreSQL | Matches your own notes; relational fits this data perfectly |
-| Realtime updates | Built-in Postgres change feed via a managed provider (see Section 12), or plain polling every 5–10s as a fallback | At 120 participants, even simple polling works fine — don't over-invest here |
-| Auth | Simple username+password with hashed passwords (bcrypt) and session tokens (JWT) | No need for anything more elaborate at this scale |
-
-**Important MVP framing:** a native Android/iOS app is unnecessary complexity here — a mobile browser page with camera access does everything you need and ships in a fraction of the time.
+| Volunteer app | **Flutter** (Android build shared as an APK directly to the 8 phones) | You've chosen this — since distribution is to only 8 known people, you can skip the Play Store entirely and just share the APK file |
+| Admin dashboard | React (or plain HTML/JS) | Small dataset, no need for anything heavy |
+| Backend | **Node.js + Express** (Mongoose for MongoDB) — FastAPI + PyMongo/Motor is an equally fine alternative if your team knows Python better | Simple REST API, pairs cleanly with MongoDB |
+| Database | **MongoDB Atlas (M0 free tier)** | Finalized — see Section 5 for why 512 MB is plenty |
+| Auth | Username+PIN with hashed passwords (bcrypt) and session tokens (JWT) | No need for anything more elaborate at this scale |
+| Realtime updates | WebSocket (Socket.IO) for the admin dashboard, or polling every 5–10s as a simpler fallback | Either is fine at this scale |
 
 ---
 
-## 12. Where to Host This for Free (Sized for 120 Participants / 30 Volunteers)
+## 13. Hosting: Render + Your Keep-Alive Script
 
-This scale is genuinely tiny by web standards, so every option below has a free tier that comfortably fits — the concern isn't "will it handle the load," it's "which is easiest for a student team to set up correctly." A recommended pairing:
+**Finalized choice: Render free web service** for the backend.
 
-| Piece | Free option | Notes |
-|---|---|---|
-| **Database + Backend logic** | **Supabase** (free tier) — hosted PostgreSQL, built-in auth, and built-in realtime updates | This single service can replace a hand-built backend for most of your endpoints, since it gives you a database, row-level auth rules, and live change events out of the box. Free tier easily covers a database this small. |
-| **Custom backend logic** (the validation rules, e.g. "block duplicate lunch," "check sequence") | **Supabase Edge Functions**, or a small Node/FastAPI app on **Render** (free web service tier) or **Railway** (free trial credits) | Use this for anything more custom than Supabase's default database rules cover. |
-| **Admin dashboard (website)** | **Vercel** or **Netlify** free tier | Both give free hosting + a live URL for a React/static site, with automatic deploys from GitHub. |
-| **Volunteer app (mobile web)** | Same as above — **Vercel/Netlify** free tier | It's just another web page; no separate hosting needed. |
-| **QR code generation** | Any open-source QR library (e.g. `qrcode` npm package) run locally when generating ID cards — no hosting needed | You generate these once before the event, not live. |
+Render's free tier sleeps a service after **15 minutes** of no incoming traffic, and the first request after sleeping takes 30–60 seconds to wake up. Your plan — a script that pings the backend's URL every **9 minutes** — is the right fix, and 9 minutes is safely under the 15-minute threshold with margin for network delays.
 
-**Why this combo specifically:** Supabase alone gives you Postgres + Auth + Realtime for free, which covers roughly 60–70% of the "hard parts" of this project without you writing that infrastructure yourself. That's a large amount of saved effort for a student team on a deadline. Vercel/Netlify are the standard free choices for hosting the two websites.
+**How to build the keep-alive script (two options):**
+- **Simple/free and reliable:** use a free external cron service like [cron-job.org](https://cron-job.org) or UptimeRobot to hit a lightweight `GET /health` endpoint on your backend every 9 minutes. This is more reliable than self-pinging because it runs outside Render, so it isn't affected by your own service sleeping.
+- **Self-pinging (inside your own backend):** a `setInterval` or `node-cron` job inside the Express app that calls its own `/health` route every 9 minutes. Simpler to set up, but has a chicken-and-egg risk if the service ever cold-starts from something outside your control (a deploy, a crash) — the external cron option avoids that.
 
-One caution: free tiers on services like Render can "sleep" after inactivity and take a few seconds to wake up on the first request. For a live event, do a test scan right before doors open to "wake up" the backend, or choose Supabase Edge Functions (which don't have this cold-start sleep behavior) for anything scan-critical.
+**One number worth knowing:** Render's free tier gives **750 instance-hours/month**, and a 31-day month has 744 hours. Keeping the service awake 24/7 all month fits *just* inside that limit — but it's tight. If you only need it awake during your active dev/testing days and the event itself (not the full month), turn the keep-alive off outside those windows so you have hours to spare rather than running right at the edge.
+
+Add a simple `/health` endpoint that just returns `{ status: "ok" }` — this is what the keep-alive pings hit, and it avoids putting load on your real database-touching endpoints just to stay awake.
 
 ---
 
-## 13. MVP vs. Later vs. Skip Entirely
+## 14. MVP vs. Later vs. Skip Entirely
 
 | Feature | MVP (build first) | Add if time allows | Skip — unnecessary here |
 |---|---|---|---|
-| QR scan + participant lookup | ✅ | | |
-| Registration checklist + backend validation | ✅ | | |
-| Food (breakfast/lunch/dinner) with duplicate prevention | ✅ | | |
-| Night entry tracking | ✅ | | |
-| Admin overview counts | ✅ | | |
-| Admin participant table + individual history | ✅ | | |
-| Role-based login (admin vs volunteer) | ✅ | | |
-| Live-updating dashboard (realtime push) | | ✅ (polling every 5–10s is a fine MVP substitute) | |
+| QR scan + participant/volunteer lookup | ✅ | | |
+| Registration checklist (participants only) + backend validation | ✅ | | |
+| Food (breakfast/lunch/dinner) for participants **and** volunteers, duplicate-proof | ✅ | | |
+| Night entry for participants **and** volunteers | ✅ | | |
+| Admin overview counts, split by participant/volunteer | ✅ | | |
+| Admin tables + individual history | ✅ | | |
+| Role-based login (admin vs. 8 volunteer accounts) | ✅ | | |
+| Render keep-alive script | ✅ | | |
+| Live-updating dashboard (realtime push) | | ✅ (5–10s polling is a fine MVP substitute) | |
 | CSV export | | ✅ | |
 | Admin "override" for correcting mistaken duplicates | | ✅ | |
-| Offline mode with later sync | | | ❌ — adds serious complexity (conflict resolution) for a single-venue, likely-WiFi-covered event |
-| QR signing / cryptographic verification | | | ❌ — a long random token is already sufficient at this scale |
-| Native mobile app | | | ❌ — mobile web page is strictly simpler and faster to ship |
-| Microservices / multiple backend services | | | ❌ — one small backend service is all you need |
-| Horizontal auto-scaling infrastructure | | | ❌ — 30 volunteers scanning is nowhere near a load concern |
+| Offline mode with later sync | | | ❌ — adds real complexity for a single-venue event |
+| QR signing / cryptographic verification | | | ❌ — random UUID token is sufficient here |
+| Publishing the Flutter app to Play Store | | | ❌ — unnecessary for 8 known phones, just share the APK |
+| Microservices | | | ❌ — one backend service is all you need |
 
 ---
 
-## 14. Edge Cases Worth Planning For
+## 15. Edge Cases Worth Planning For
 
-- **Volunteer needs to undo a mistaken scan** (wrong person, fat-fingered button): don't allow `DELETE` on action rows even for admins — instead, add an `is_voided` flag admins can set, so the audit trail is never actually erased, just marked invalid.
-- **QR code physically damaged/unreadable**: give volunteers a manual fallback — a small search-by-name/ID box for the rare case where a card won't scan.
-- **Participant loses ID card**: admin panel should let an admin look up a participant and re-print/reissue the same QR token (don't generate a new one, or their history would split across two tokens).
-- **Volunteer's phone loses signal mid-event**: show a clear "connection lost, please retry" message rather than a silent failure — don't let the app pretend an action succeeded when it didn't reach the backend.
-- **Two people with visually similar names**: always confirm the Participant ID and photo (if you include one) on screen before letting the volunteer hit the action button, not just the name.
-- **Event runs late / activity needed outside "normal" hours**: don't hardcode a time window — rely on the simple `is_active` flag mentioned in Section 6 instead.
+- **Volunteer needs to undo a mistaken scan:** don't allow `DELETE` on action documents even for admins — add an `is_voided` flag instead, so the audit trail is never erased, only marked invalid.
+- **QR code damaged/unreadable:** give volunteers a manual fallback — a search-by-name/ID box in the app for when a card won't scan.
+- **Volunteer's own badge is lost:** admin should be able to look up that volunteer and reissue their existing token (don't generate a new one, or their history splits across two tokens).
+- **A volunteer without `app_access` accidentally tries to log in:** backend should reject clearly ("this account does not have scanner access") rather than silently failing.
+- **Phone loses signal mid-event:** show a clear "connection lost, please retry" message — never let the app pretend an action succeeded when it didn't reach the backend.
+- **Registration accidentally attempted on a volunteer's badge:** backend rejects it with the `ACTION_NOT_APPLICABLE` response from Section 11 — this needs to be one of your very first tests.
+- **Render cold start right as the event starts:** send a manual warm-up ping ~10 minutes before doors open, even with the 9-minute keep-alive running, as a safety margin.
 
 ---
 
-## 15. Suggested Folder Structure
+## 16. Suggested Folder Structure
 
 ```
 backend/
   src/
-    routes/        (auth.js, scan.js, actions.js, dashboard.js, volunteers.js)
-    controllers/    (business logic for each route)
-    middleware/     (auth check, role check)
-    db/             (connection + queries)
+    routes/         (auth.js, scan.js, actions.js, dashboard.js, volunteers.js, health.js)
+    controllers/     (business logic for each route)
+    middleware/      (auth check, role check, subject-type/action-type validity check)
+    models/          (Mongoose schemas: Participant, Volunteer, Action, Team)
+    db/              (MongoDB connection)
   package.json
 
 admin-dashboard/
   src/
-    pages/          (Login, Overview, ParticipantTable, ParticipantHistory, Volunteers)
-    components/     (StatCard, Table, Timeline)
-    api/            (calls to backend)
+    pages/           (Login, Overview, ParticipantTable, VolunteerTable, History, ManageVolunteers)
+    components/       (StatCard, Table, Timeline)
+    api/              (calls to backend)
 
-volunteer-app/
-  src/
-    pages/          (Login, Registration, Food, NightEntry)
-    components/      (QRScanner, ParticipantCard, ActionButton)
-    api/
+volunteer-app-flutter/
+  lib/
+    screens/          (login_screen.dart, registration_screen.dart, food_screen.dart, night_entry_screen.dart)
+    widgets/           (qr_scanner.dart, person_card.dart, action_button.dart)
+    services/          (api_service.dart)
 ```
 
 ---
 
-## 16. Deployment Architecture (Putting It All Together)
+## 17. Deployment Architecture
 
 ```mermaid
 flowchart LR
     subgraph Internet
-        U1[Volunteer phones]
+        U1[8 Volunteer phones<br/>Flutter app]
         U2[Admin laptop]
+        CRON[Free external cron<br/>pings every 9 min]
     end
 
-    U1 -->|HTTPS| VApp[Volunteer App<br/>hosted on Vercel/Netlify]
-    U2 -->|HTTPS| AApp[Admin Dashboard<br/>hosted on Vercel/Netlify]
+    U1 -->|HTTPS| BE[Backend API<br/>Render free web service]
+    U2 -->|HTTPS| AApp[Admin Dashboard<br/>hosted on Render/Vercel/Netlify]
+    CRON -->|GET /health every 9 min| BE
 
-    VApp -->|API calls| BE[Backend API<br/>Supabase Edge Functions<br/>or Render free tier]
     AApp -->|API calls| BE
-    BE --> DB[(Supabase PostgreSQL)]
+    BE --> DB[(MongoDB Atlas M0)]
     DB -.->|realtime events| AApp
 ```
 
 ---
 
-## 17. Testing Strategy (Kept Realistic for a Student Team)
+## 18. Testing Strategy
 
-- **Before the event, with fake data:** create ~10 dummy participants, simulate the full journey (registration → kit → all meals → night entry) for each, and specifically try to double-scan the same action to confirm the duplicate-prevention actually blocks it.
-- **Load check:** even a rough manual test — have 5–6 phones scan in quick succession — is enough at this scale; you don't need a formal load-testing tool.
-- **Dry run night-before:** have real volunteers use the real app on real phones for a 15-minute rehearsal with a handful of test QR cards. This catches UI/scanning friction issues that are easy to miss testing alone.
-- **Have a manual fallback ready:** a simple paper backup sheet for each station, just in case the network goes down entirely during the event — the system should reduce manual work, not become a single point of failure for the whole event.
-
----
-
-## 18. One-Paragraph Summary
-
-Every participant gets one QR code containing a random token. Volunteers use a simple mobile web page to scan it, which asks the backend "who is this and what's their status?" — the backend is the only place that knows the rules (don't double-give lunch, don't give a kit before registration), and it records every single action as its own timestamped, volunteer-attributed row rather than just flipping a `true/false`. The admin dashboard reads from that same live data and updates automatically. At 120 participants and 30 volunteers, this whole system comfortably fits on free hosting tiers (Supabase + Vercel/Netlify), and the biggest risk to avoid is over-building — a native app, offline sync, and cryptographic QR signing are all unnecessary complexity for an event this size.
-# Event QR Participant Management System — Architecture Document
-
-**Scale target:** ~120 participants, ~30 volunteers, single overnight hackathon event
-**Goal:** A simple, reliable system a student team can actually build and deploy — not an over-engineered one.
+- **Before the event, with fake data:** create ~10 dummy participants and 2–3 dummy volunteers, simulate the full journey for each, and specifically try to double-scan the same action to confirm the duplicate index actually blocks it.
+- **Test the participant/volunteer split explicitly:** try scanning a volunteer's QR on the Registration tab and confirm you get the "doesn't apply" error, not a crash.
+- **Test the 8-account limit:** try logging in with a volunteer account that has `app_access: false` and confirm it's rejected.
+- **Keep-alive check:** leave the backend idle for 20+ minutes and confirm the cron ping is actually preventing the sleep (check Render's logs).
+- **Dry run night-before:** real volunteers, real phones, real Flutter app, a handful of test QR badges for 15 minutes — this catches UI/scanning friction you won't find testing alone.
+- **Manual fallback ready:** a simple paper backup sheet per station in case the network goes down entirely during the event.
 
 ---
 
-## 1. What We Are Actually Building (Plain Explanation)
+## 19. One-Paragraph Summary
 
-Three pieces of software, all talking to **one shared backend and one shared database**:
-
-1. **Volunteer App** — a phone-friendly web page (not a native app) that volunteers open in their phone's browser. It scans QR codes using the phone camera and lets the volunteer mark an action (registration, food, night entry).
-2. **Admin Dashboard** — a website coordinators open on a laptop. Shows live counts, participant tables, and full history per participant.
-3. **Backend API + Database** — the "brain." Every scan from every volunteer phone goes here. It decides if the action is allowed, records it, and pushes the update to the admin dashboard.
-
-**Why one shared backend matters:** this is the whole point of the system. No app "remembers" anything on its own — the phone is just a scanner + button. The backend is the single source of truth, so two volunteers can never accidentally give the same person lunch twice.
-
-At your scale (120 people, 30 volunteers), this is a genuinely small system. The hard technical problems (millions of rows, huge concurrent load) don't apply to you — the design below is intentionally light.
-
----
-
-## 2. High-Level Architecture
-
-```mermaid
-flowchart TB
-    subgraph Clients
-        A[Admin Dashboard<br/>Web app, laptop]
-        V[Volunteer Web App<br/>Mobile browser, camera scan]
-    end
-
-    subgraph Backend
-        API[Backend API<br/>Node.js / FastAPI]
-        AUTH[Auth + Role Check]
-        LOGIC[Business Rules<br/>duplicate checks, sequence checks]
-    end
-
-    DB[(PostgreSQL Database<br/>Participants, Volunteers, Actions Log)]
-    RT[Realtime Updates<br/>WebSocket / Supabase Realtime]
-
-    A -->|HTTPS requests| API
-    V -->|HTTPS requests| API
-    API --> AUTH --> LOGIC --> DB
-    DB -->|change events| RT
-    RT -->|live push| A
-```
-
-**In words:** both apps are just "thin clients" — they show data and send requests. All the real decision-making (is this allowed? has it already happened?) lives in the backend, never in the app itself. This is the single most important design rule for this whole project.
-
----
-
-## 3. What's On the QR Code
-
-**Rule: the QR code contains almost nothing.** It is just a random lookup key, not participant data.
-
-```
-QR content  =  a random unique token string
-Example:    =  "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f"
-```
-
-**Why not just print the Participant ID (EVT-00125) in the QR?**
-It's simpler, but anyone could guess or recreate IDs sequentially (EVT-00001, EVT-00002...) and print a fake card. A long random token is hard to guess and costs nothing extra to implement.
-
-Flow every time a QR is scanned:
-
-```
-Scanned text (token)
-      ↓
-Sent to backend: POST /scan { token }
-      ↓
-Backend looks up participant by token
-      ↓
-Backend returns: name, team, college, current status
-      ↓
-App displays participant + relevant action buttons
-```
-
-**At registration time**, you generate this token once per participant (e.g. with a UUID library), save it in the database next to that participant's row, and print it as a QR on their ID card. That's it — no signing, no encryption needed at this scale. A long random UUID is already effectively unguessable.
-
----
-
-## 4. Database Schema (Simple, Action-Log Based)
-
-You had the right instinct in your notes: **don't just store `lunch = true/false`. Store a log of events.** Booleans lose "when" and "who." A log gives you both, and the booleans/status you need for the UI can be *derived* from the log.
-
-```mermaid
-erDiagram
-    TEAMS ||--o{ PARTICIPANTS : has
-    PARTICIPANTS ||--o{ ACTIONS : "has history of"
-    VOLUNTEERS ||--o{ ACTIONS : performs
-
-    TEAMS {
-        int team_id PK
-        string team_name
-    }
-
-    PARTICIPANTS {
-        int participant_id PK
-        string name
-        string college
-        int team_id FK
-        string qr_token UK
-        timestamp created_at
-    }
-
-    VOLUNTEERS {
-        int volunteer_id PK
-        string username
-        string password_hash
-        string role
+Every participant and every one of the 8 app-enabled volunteers gets a QR code with a random token. The Flutter app scans it and asks the backend "who is this, and what's their status?" — the backend is the only place that knows the rules (registration is participant-only; food and night entry apply to both participants and volunteers; nothing can be recorded twice), and it stores every action as its own timestamped, volunteer-attributed MongoDB document rather than a simple true/false flag. The admin web dashboard reads that same live data and updates automatically, showing participants and volunteers as clearly separated but simultaneously visible counts. The whole system runs on MongoDB Atlas's free tier (which is drastically oversized for this data) and Render's free tier (kept awake by your 9-minute keep-alive ping), with zero App Store/Play Store overhead since the Flutter app only ever needs to reach 8 phones.
+        boolean app_access
         string assigned_station
+        timestamp created_at
     }
 
     ACTIONS {
-        int action_id PK
-        int participant_id FK
-        int volunteer_id FK
+        string action_id PK
+        string subject_type
+        string subject_id
         string action_type
+        string performed_by_volunteer_id FK
         timestamp created_at
     }
 ```
 
-**`action_type` values (the full list you need):**
-`ID_VERIFIED`, `REGISTRATION_COMPLETED`, `KIT_ISSUED`, `PAPER_SIGNED`, `BREAKFAST`, `LUNCH`, `DINNER`, `NIGHT_ENTRY`
-
-**The one critical database rule (this solves duplicate-prevention AND concurrency in one line):**
-
-```sql
-CREATE UNIQUE INDEX one_action_per_participant
-ON actions (participant_id, action_type);
+**`participants` collection** — one document per participant:
+```json
+{
+  "_id": "EVT-00125",
+  "name": "Rahul Kumar",
+  "college": "XYZ College",
+  "team_id": "TEAM-ALPHA",
+  "qr_token": "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f",
+  "created_at": "2026-09-18T06:00:00Z"
+}
 ```
 
-This tells PostgreSQL itself: *"this participant can never have two `LUNCH` rows."* Even if two volunteers scan the same person at the exact same millisecond, the database will accept the first insert and reject the second automatically. You don't need to write clever locking code — the database does it for you for free. This is explained more in Section 8.
+**`volunteers` collection** — one document per volunteer. `app_access` marks exactly which volunteers can log into the Flutter app (your "only 8" rule) — this lets you add more volunteers to the system later (for meal tracking etc.) without automatically giving them scanner-app logins:
+```json
+{
+  "_id": "VOL-018",
+  "name": "Aisha Verma",
+  "username": "vol018",
+  "password_hash": "•••••",
+  "qr_token": "5e2a11f0-...",
+  "app_access": true,
+  "assigned_station": "food",
+  "created_at": "2026-09-18T06:00:00Z"
+}
+```
 
-A participant's "status" (e.g., "Lunch: Given ✓") is simply: *does a `LUNCH` row exist for this participant?* You don't need a separate status table.
+**`actions` collection** — the single event log, shared by participants and volunteers, using `subject_type` to tell them apart:
+```json
+{
+  "_id": "ACT-004821",
+  "subject_type": "participant",
+  "subject_id": "EVT-00125",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:04:52Z"
+}
+```
+```json
+{
+  "_id": "ACT-004822",
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:11:09Z"
+}
+```
+
+**`action_type` values, and who they apply to:**
+
+| action_type | Applies to |
+|---|---|
+| `ID_VERIFIED` | Participants only |
+| `REGISTRATION_COMPLETED` | Participants only |
+| `KIT_ISSUED` | Participants only |
+| `PAPER_SIGNED` | Participants only |
+| `BREAKFAST` / `LUNCH` / `DINNER` | Participants **and** volunteers |
+| `NIGHT_ENTRY` | Participants **and** volunteers |
+
+### The one critical rule that prevents duplicates (MongoDB version)
+
+```js
+db.actions.createIndex(
+  { subject_type: 1, subject_id: 1, action_type: 1 },
+  { unique: true }
+)
+```
+
+This tells MongoDB: *"this exact subject (participant OR volunteer) can never have two `LUNCH` rows."* If two volunteers scan the same person for lunch at the same moment, MongoDB accepts the first insert and rejects the second with an `E11000 duplicate key` error — your backend catches that specific error and turns it into a clean "Lunch already given" message. No manual locking code needed.
+
+A person's status (e.g. "Lunch: Given ✓") is simply: *does an action document exist for `(subject_type, subject_id, 'LUNCH')`?* You don't need a separate status field to keep in sync.
 
 ---
 
-## 5. Volunteer App — Screens & Flow
+## 5. How Data Storage Size Actually Looks (MongoDB Atlas Free Tier)
+
+| Collection | Docs | Rough size each | Total |
+|---|---|---|---|
+| participants | 120 | ~0.5 KB | ~60 KB |
+| volunteers | ~10–30 | ~0.3 KB | ~10 KB |
+| teams | ~20 | ~0.2 KB | ~4 KB |
+| actions | up to (120+8) × ~7 actions ≈ 900 | ~0.3 KB | ~270 KB |
+
+**Total real data: well under 1 MB**, even generously padded for indexes it stays in the low single-digit MB. Your MongoDB Atlas **free M0 tier (512 MB)** is 100x+ more than you will ever need — it is not something to worry about for this event.
+
+---
+
+## 6. Volunteer App (Flutter) — Screens & Flow
 
 ```mermaid
 flowchart TD
-    L[Login: Volunteer ID + PIN] --> N{Bottom Nav}
+    L[Login: Volunteer ID + PIN<br/>only 8 accounts are valid] --> N{Bottom Nav}
     N --> R[Registration Tab]
     N --> F[Food Tab]
     N --> NE[Night Entry Tab]
 
     R --> RS[Tap SCAN QR]
     RS --> RC[Camera opens, scans QR]
-    RC --> RP[Participant card shown<br/>+ checklist]
+    RC --> RCheck{Token belongs to<br/>a participant?}
+    RCheck -- No, it's a volunteer --> RErr[Registration does not apply<br/>to volunteers — show message]
+    RCheck -- Yes --> RP[Participant card shown<br/>+ checklist]
     RP --> RD[Volunteer taps DONE]
     RD --> RB[Backend validates + saves]
     RB --> RSucc[Success screen] --> RS
@@ -1004,129 +1159,134 @@ flowchart TD
     B1 --> FS[SCAN QR]
     L1 --> FS
     D1 --> FS
-    FS --> FC[Participant shown<br/>+ GIVE MEAL button]
-    FC --> FB[Backend validates + saves]
+    FS --> FDetect{Participant or volunteer?}
+    FDetect --> FC[Person shown<br/>+ GIVE MEAL button]
+    FC --> FB[Backend validates + saves<br/>subject_type set automatically]
     FB --> FSucc[Success] --> FS
 
     NE --> NS[SCAN QR]
-    NS --> NC[Participant shown<br/>+ ENTRY button]
+    NS --> NDetect{Participant or volunteer?}
+    NDetect --> NC[Person shown<br/>+ ENTRY button]
     NC --> NB[Backend validates + saves]
     NB --> NSucc[Success] --> NS
 ```
 
-**Design principle:** after every successful action, the screen should snap straight back to "ready to scan the next person" — minimum taps, no dead ends. This matters a lot in practice because volunteers will be doing this hundreds of times in a row.
+Notice the Registration tab is the one exception that explicitly rejects volunteer QR codes — that's the one workflow that's participant-only per Section 4's table.
+
+**Login for the app:** since only 8 volunteers ever use it, keep this dead simple — a `volunteer_id` + PIN login screen, and the backend only issues a valid session if that volunteer's document has `app_access: true`.
 
 ---
 
-## 6. Backend Flow — What Happens on Every Scan (Step by Step)
+## 7. Backend Flow — What Happens on Every Scan
 
-This is the same shape for registration, food, and night entry — only the `action_type` changes.
+Same shape for every tab; only `action_type` and which collection is checked (`subject_type`) changes.
 
 ```mermaid
 flowchart TD
-    S[Volunteer app sends:<br/>token + action_type + volunteer_id] --> A{Is volunteer<br/>logged in and authorized<br/>for this action?}
+    S[App sends:<br/>token + action_type + volunteer_session] --> A{Is this one of the<br/>8 logged-in volunteers,<br/>authorized for this station?}
     A -- No --> E1[403: Not authorized]
-    A -- Yes --> B{Does token match<br/>a participant?}
-    B -- No --> E2[404: Participant not found]
-    B -- Yes --> C{Does an action row<br/>already exist for<br/>this participant + type?}
-    C -- Yes --> E3[409: Already done<br/>show who/when]
+    A -- Yes --> B{Does token match a<br/>participant OR a volunteer?}
+    B -- No --> E2[404: Not found]
+    B -- Yes --> C0{Is this action type<br/>allowed for this subject_type?<br/>e.g. REGISTRATION blocked for volunteers}
+    C0 -- No --> E5[400: This action doesn't apply here]
+    C0 -- Yes --> C{Does an action already exist for<br/>this subject_type + subject_id + action_type?}
+    C -- Yes --> E3[409: Already done — show who/when]
     C -- No --> D{Are prerequisite steps done?<br/>e.g. registration before kit}
     D -- No --> E4[400: Complete earlier step first]
-    D -- Yes --> F[INSERT new action row<br/>participant_id, volunteer_id,<br/>action_type, timestamp]
+    D -- Yes --> F[INSERT new action document]
     F --> G[Return success + updated status]
     G --> H[Realtime event fires →<br/>admin dashboard updates live]
 ```
 
-**Plain-English summary of the 6 backend checks from your notes**, mapped directly onto this diagram:
-1. Participant exists → step B
-2. QR valid → same as B (invalid token = no match)
-3. Action already completed → step C
-4. Volunteer authorized → step A
-5. Previous steps completed → step D
-6. Event currently active → an extra simple check: a single `event_settings` row with `is_active = true/false` that the admin can flip
-
 ---
 
-## 7. Admin Dashboard — Screens & Flow
+## 8. Admin Dashboard — Screens & Flow
 
 ```mermaid
 flowchart TD
     AL[Admin Login] --> D[Dashboard Home]
-    D --> OV[Live Overview Cards<br/>Total / Registered / Kits / Meals / Night Entry]
+    D --> OV[Live Overview Cards<br/>Participants: Registered / Kits / Meals / Night Entry<br/>Volunteers: Meals / Night Entry]
     D --> PT[Participant Table<br/>filter/search by team or status]
+    D --> VT[Volunteer Table<br/>meals + night entry status]
     PT --> PP[Click a participant]
-    PP --> PH[Full History Timeline<br/>every action + time + volunteer]
-    D --> VM[Volunteer Management<br/>add/disable volunteer accounts]
+    VT --> VP[Click a volunteer]
+    PP --> PH[Full History Timeline]
+    VP --> VH[Full History Timeline]
+    D --> VM[Manage Volunteers<br/>add/disable app_access for the 8 accounts]
     D --> EX[Export CSV]
     OV -.->|auto-updates live| RTX[Realtime channel]
     PT -.->|auto-updates live| RTX
+    VT -.->|auto-updates live| RTX
 ```
 
-**How the live-updating actually works (in simple terms):** the admin dashboard doesn't repeatedly ask "anything new?" every second (that's wasteful). Instead, it opens one persistent connection to the backend. Whenever any volunteer's scan is saved to the database, the backend immediately pushes that one small update down that open connection, and the dashboard re-renders just that part of the screen — the count ticks up instantly without a manual refresh.
+**Combined "has everyone eaten" view:** the overview cards show participants and volunteers as two related-but-separate counts (e.g. "Lunch — Participants: 98/120, Volunteers: 7/8") so the admin can see the full picture without the two groups' numbers blending together confusingly.
+
+**How live-updating works:** the dashboard opens one persistent connection to the backend. Whenever any scan is saved, the backend pushes that one small update down the open connection and the dashboard re-renders just that part — no manual refresh needed.
 
 ---
 
-## 8. Duplicate Prevention & Concurrency — Explained Simply
+## 9. Duplicate Prevention & Concurrency — Explained Simply
 
-**The scenario you're worried about:** two volunteers scan the same participant for lunch within the same second, both from an app that still shows "Lunch: Not Given."
+**The scenario:** two volunteers scan the same person for lunch within the same second.
 
-**The wrong way to solve it:** check "has lunch been given?" and then, a moment later, insert the record. There's a tiny gap between the check and the insert — and in that gap, both requests can slip through. This is called a "race condition."
+**The wrong way:** check "already given?" then insert a moment later — there's a small gap where both requests can slip through (a "race condition").
 
-**The right way (and it's actually simpler to build):** let the database's unique constraint from Section 4 be the single source of truth. Both requests try to `INSERT`. The database physically only allows one row to exist for `(participant_id, 'LUNCH')`. The first insert succeeds. The second one is rejected by the database itself with an error — the backend catches that specific error and turns it into a clean "Lunch already given" message. You never need custom locking logic; you're just letting Postgres do what it's built to do.
-
-At 120 participants and 30 volunteers, true simultaneous double-scans will be rare, but building it this way costs no extra effort and removes the entire problem permanently.
+**The right way:** let MongoDB's unique index (Section 4) be the single source of truth. Both requests try to insert. MongoDB physically allows only one document for `(subject_type, subject_id, action_type)`. The first insert succeeds; the second is rejected by the database itself, and the backend turns that rejection into a clean "already given" message. No custom locking code required.
 
 ---
 
-## 9. Roles & Permissions
+## 10. Roles & Permissions
 
-| Action | Admin | Volunteer |
+| Action | Admin | Volunteer (1 of the 8) |
 |---|---|---|
 | Scan & record actions | ✅ (all types) | ✅ (only for their assigned tab/station) |
-| View all participants | ✅ | ❌ (only the one they just scanned) |
+| View all participants/volunteers | ✅ | ❌ (only the one they just scanned) |
 | View full activity log / audit trail | ✅ | ❌ |
-| Add/disable volunteer accounts | ✅ | ❌ |
-| Override a duplicate action (correct a mistake) | ✅ | ❌ |
-| Edit participant details | ✅ | ❌ |
-| Delete any record | ❌ (avoid entirely, even for admin — see Section 14) | ❌ |
+| Add/disable volunteer app access | ✅ | ❌ |
+| Override a duplicate action (fix a mistake) | ✅ | ❌ |
+| Edit participant/volunteer details | ✅ | ❌ |
+| Delete any record | ❌ (avoid entirely — see Section 15) | ❌ |
 | Export data | ✅ | ❌ |
 
-Practically: a volunteer's login token just carries `role: volunteer` and `station: food` (or similar). The backend checks this on **every** request — never trust the app screen to decide what a user is "allowed" to see, since the screen can be tampered with but the backend check cannot.
+A volunteer's login session carries `role: volunteer`, `volunteer_id`, and `station`. The backend checks this on **every** request — never trust the app screen alone, since a screen can be tampered with but a backend check cannot.
 
 ---
 
-## 10. API Endpoints (What You'll Actually Build)
+## 11. API Endpoints
 
 ```
-POST   /auth/login                 → returns a session token for admin or volunteer
-POST   /scan                       → { token } → returns participant info + current status
-POST   /actions                    → { participant_id, action_type } → records one action
-GET    /participants               → admin only, full table
-GET    /participants/:id/history   → full timeline for one participant
-GET    /dashboard/summary          → live counts for the overview cards
-GET    /volunteers                 → admin only
-POST   /volunteers                 → admin only, create volunteer login
+POST   /auth/login                    → returns a session token (admin or one of the 8 volunteers)
+POST   /scan                          → { token } → returns subject_type + person info + current status
+POST   /actions                       → { subject_type, subject_id, action_type } → records one action
+GET    /participants                  → admin only, full table
+GET    /volunteers                    → admin only, full table
+GET    /participants/:id/history      → full timeline for one participant
+GET    /volunteers/:id/history        → full timeline for one volunteer
+GET    /dashboard/summary             → live counts (participants + volunteers, separated)
+POST   /volunteers                    → admin only, create a volunteer (app_access true/false)
 ```
 
-**Example: recording a lunch scan**
+**Example: recording a volunteer's own lunch**
 
 Request:
 ```json
 POST /actions
 {
-  "participant_id": "EVT-00125",
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
   "action_type": "LUNCH"
 }
 ```
-(volunteer identity comes from their login session, not the request body — this stops a volunteer from claiming to be someone else)
+(the scanning volunteer's own identity comes from their login session, not the request body)
 
 Success response:
 ```json
 {
   "status": "success",
+  "subject_type": "volunteer",
   "action_type": "LUNCH",
-  "recorded_at": "2026-09-18T13:04:52Z",
-  "volunteer": "VOL-018"
+  "recorded_at": "2026-09-18T13:11:09Z",
+  "performed_by": "VOL-018"
 }
 ```
 
@@ -1136,134 +1296,661 @@ Duplicate response:
   "status": "error",
   "code": "ALREADY_DONE",
   "message": "Lunch has already been given.",
-  "given_at": "2026-09-18T13:04:52Z",
+  "given_at": "2026-09-18T13:11:09Z",
   "given_by": "VOL-018"
+}
+```
+
+Wrong-action-type response (e.g. trying REGISTRATION on a volunteer):
+```json
+{
+  "status": "error",
+  "code": "ACTION_NOT_APPLICABLE",
+  "message": "Registration does not apply to volunteers."
 }
 ```
 
 ---
 
-## 11. Recommended Tech Stack (Sized for a Student Team, 120 People)
+## 12. Final Tech Stack
 
-| Layer | Recommendation | Why |
+| Layer | Choice | Why |
 |---|---|---|
-| Volunteer app | **Mobile web app (PWA)**, not a native app | Skips app-store approval entirely. Any phone camera can scan via browser using a library like `html5-qrcode`. Just share a link. |
-| Admin dashboard | React (or plain HTML/JS if the team is less experienced) | Small dataset, no need for anything heavy |
-| Backend | Node.js + Express, **or** Python + FastAPI | Whichever your team already knows best — either is more than capable at this scale |
-| Database | PostgreSQL | Matches your own notes; relational fits this data perfectly |
-| Realtime updates | Built-in Postgres change feed via a managed provider (see Section 12), or plain polling every 5–10s as a fallback | At 120 participants, even simple polling works fine — don't over-invest here |
-| Auth | Simple username+password with hashed passwords (bcrypt) and session tokens (JWT) | No need for anything more elaborate at this scale |
-
-**Important MVP framing:** a native Android/iOS app is unnecessary complexity here — a mobile browser page with camera access does everything you need and ships in a fraction of the time.
+| Volunteer app | **Flutter** (Android build shared as an APK directly to the 8 phones) | You've chosen this — since distribution is to only 8 known people, you can skip the Play Store entirely and just share the APK file |
+| Admin dashboard | React (or plain HTML/JS) | Small dataset, no need for anything heavy |
+| Backend | **Node.js + Express** (Mongoose for MongoDB) — FastAPI + PyMongo/Motor is an equally fine alternative if your team knows Python better | Simple REST API, pairs cleanly with MongoDB |
+| Database | **MongoDB Atlas (M0 free tier)** | Finalized — see Section 5 for why 512 MB is plenty |
+| Auth | Username+PIN with hashed passwords (bcrypt) and session tokens (JWT) | No need for anything more elaborate at this scale |
+| Realtime updates | WebSocket (Socket.IO) for the admin dashboard, or polling every 5–10s as a simpler fallback | Either is fine at this scale |
 
 ---
 
-## 12. Where to Host This for Free (Sized for 120 Participants / 30 Volunteers)
+## 13. Hosting: Render + Your Keep-Alive Script
 
-This scale is genuinely tiny by web standards, so every option below has a free tier that comfortably fits — the concern isn't "will it handle the load," it's "which is easiest for a student team to set up correctly." A recommended pairing:
+**Finalized choice: Render free web service** for the backend.
 
-| Piece | Free option | Notes |
-|---|---|---|
-| **Database + Backend logic** | **Supabase** (free tier) — hosted PostgreSQL, built-in auth, and built-in realtime updates | This single service can replace a hand-built backend for most of your endpoints, since it gives you a database, row-level auth rules, and live change events out of the box. Free tier easily covers a database this small. |
-| **Custom backend logic** (the validation rules, e.g. "block duplicate lunch," "check sequence") | **Supabase Edge Functions**, or a small Node/FastAPI app on **Render** (free web service tier) or **Railway** (free trial credits) | Use this for anything more custom than Supabase's default database rules cover. |
-| **Admin dashboard (website)** | **Vercel** or **Netlify** free tier | Both give free hosting + a live URL for a React/static site, with automatic deploys from GitHub. |
-| **Volunteer app (mobile web)** | Same as above — **Vercel/Netlify** free tier | It's just another web page; no separate hosting needed. |
-| **QR code generation** | Any open-source QR library (e.g. `qrcode` npm package) run locally when generating ID cards — no hosting needed | You generate these once before the event, not live. |
+Render's free tier sleeps a service after **15 minutes** of no incoming traffic, and the first request after sleeping takes 30–60 seconds to wake up. Your plan — a script that pings the backend's URL every **9 minutes** — is the right fix, and 9 minutes is safely under the 15-minute threshold with margin for network delays.
 
-**Why this combo specifically:** Supabase alone gives you Postgres + Auth + Realtime for free, which covers roughly 60–70% of the "hard parts" of this project without you writing that infrastructure yourself. That's a large amount of saved effort for a student team on a deadline. Vercel/Netlify are the standard free choices for hosting the two websites.
+**How to build the keep-alive script (two options):**
+- **Simple/free and reliable:** use a free external cron service like [cron-job.org](https://cron-job.org) or UptimeRobot to hit a lightweight `GET /health` endpoint on your backend every 9 minutes. This is more reliable than self-pinging because it runs outside Render, so it isn't affected by your own service sleeping.
+- **Self-pinging (inside your own backend):** a `setInterval` or `node-cron` job inside the Express app that calls its own `/health` route every 9 minutes. Simpler to set up, but has a chicken-and-egg risk if the service ever cold-starts from something outside your control (a deploy, a crash) — the external cron option avoids that.
 
-One caution: free tiers on services like Render can "sleep" after inactivity and take a few seconds to wake up on the first request. For a live event, do a test scan right before doors open to "wake up" the backend, or choose Supabase Edge Functions (which don't have this cold-start sleep behavior) for anything scan-critical.
+**One number worth knowing:** Render's free tier gives **750 instance-hours/month**, and a 31-day month has 744 hours. Keeping the service awake 24/7 all month fits *just* inside that limit — but it's tight. If you only need it awake during your active dev/testing days and the event itself (not the full month), turn the keep-alive off outside those windows so you have hours to spare rather than running right at the edge.
+
+Add a simple `/health` endpoint that just returns `{ status: "ok" }` — this is what the keep-alive pings hit, and it avoids putting load on your real database-touching endpoints just to stay awake.
 
 ---
 
-## 13. MVP vs. Later vs. Skip Entirely
+## 14. MVP vs. Later vs. Skip Entirely
 
 | Feature | MVP (build first) | Add if time allows | Skip — unnecessary here |
 |---|---|---|---|
-| QR scan + participant lookup | ✅ | | |
-| Registration checklist + backend validation | ✅ | | |
-| Food (breakfast/lunch/dinner) with duplicate prevention | ✅ | | |
-| Night entry tracking | ✅ | | |
-| Admin overview counts | ✅ | | |
-| Admin participant table + individual history | ✅ | | |
-| Role-based login (admin vs volunteer) | ✅ | | |
-| Live-updating dashboard (realtime push) | | ✅ (polling every 5–10s is a fine MVP substitute) | |
+| QR scan + participant/volunteer lookup | ✅ | | |
+| Registration checklist (participants only) + backend validation | ✅ | | |
+| Food (breakfast/lunch/dinner) for participants **and** volunteers, duplicate-proof | ✅ | | |
+| Night entry for participants **and** volunteers | ✅ | | |
+| Admin overview counts, split by participant/volunteer | ✅ | | |
+| Admin tables + individual history | ✅ | | |
+| Role-based login (admin vs. 8 volunteer accounts) | ✅ | | |
+| Render keep-alive script | ✅ | | |
+| Live-updating dashboard (realtime push) | | ✅ (5–10s polling is a fine MVP substitute) | |
 | CSV export | | ✅ | |
 | Admin "override" for correcting mistaken duplicates | | ✅ | |
-| Offline mode with later sync | | | ❌ — adds serious complexity (conflict resolution) for a single-venue, likely-WiFi-covered event |
-| QR signing / cryptographic verification | | | ❌ — a long random token is already sufficient at this scale |
-| Native mobile app | | | ❌ — mobile web page is strictly simpler and faster to ship |
-| Microservices / multiple backend services | | | ❌ — one small backend service is all you need |
-| Horizontal auto-scaling infrastructure | | | ❌ — 30 volunteers scanning is nowhere near a load concern |
+| Offline mode with later sync | | | ❌ — adds real complexity for a single-venue event |
+| QR signing / cryptographic verification | | | ❌ — random UUID token is sufficient here |
+| Publishing the Flutter app to Play Store | | | ❌ — unnecessary for 8 known phones, just share the APK |
+| Microservices | | | ❌ — one backend service is all you need |
 
 ---
 
-## 14. Edge Cases Worth Planning For
+## 15. Edge Cases Worth Planning For
 
-- **Volunteer needs to undo a mistaken scan** (wrong person, fat-fingered button): don't allow `DELETE` on action rows even for admins — instead, add an `is_voided` flag admins can set, so the audit trail is never actually erased, just marked invalid.
-- **QR code physically damaged/unreadable**: give volunteers a manual fallback — a small search-by-name/ID box for the rare case where a card won't scan.
-- **Participant loses ID card**: admin panel should let an admin look up a participant and re-print/reissue the same QR token (don't generate a new one, or their history would split across two tokens).
-- **Volunteer's phone loses signal mid-event**: show a clear "connection lost, please retry" message rather than a silent failure — don't let the app pretend an action succeeded when it didn't reach the backend.
-- **Two people with visually similar names**: always confirm the Participant ID and photo (if you include one) on screen before letting the volunteer hit the action button, not just the name.
-- **Event runs late / activity needed outside "normal" hours**: don't hardcode a time window — rely on the simple `is_active` flag mentioned in Section 6 instead.
+- **Volunteer needs to undo a mistaken scan:** don't allow `DELETE` on action documents even for admins — add an `is_voided` flag instead, so the audit trail is never erased, only marked invalid.
+- **QR code damaged/unreadable:** give volunteers a manual fallback — a search-by-name/ID box in the app for when a card won't scan.
+- **Volunteer's own badge is lost:** admin should be able to look up that volunteer and reissue their existing token (don't generate a new one, or their history splits across two tokens).
+- **A volunteer without `app_access` accidentally tries to log in:** backend should reject clearly ("this account does not have scanner access") rather than silently failing.
+- **Phone loses signal mid-event:** show a clear "connection lost, please retry" message — never let the app pretend an action succeeded when it didn't reach the backend.
+- **Registration accidentally attempted on a volunteer's badge:** backend rejects it with the `ACTION_NOT_APPLICABLE` response from Section 11 — this needs to be one of your very first tests.
+- **Render cold start right as the event starts:** send a manual warm-up ping ~10 minutes before doors open, even with the 9-minute keep-alive running, as a safety margin.
 
 ---
 
-## 15. Suggested Folder Structure
+## 16. Suggested Folder Structure
 
 ```
 backend/
   src/
-    routes/        (auth.js, scan.js, actions.js, dashboard.js, volunteers.js)
-    controllers/    (business logic for each route)
-    middleware/     (auth check, role check)
-    db/             (connection + queries)
+    routes/         (auth.js, scan.js, actions.js, dashboard.js, volunteers.js, health.js)
+    controllers/     (business logic for each route)
+    middleware/      (auth check, role check, subject-type/action-type validity check)
+    models/          (Mongoose schemas: Participant, Volunteer, Action, Team)
+    db/              (MongoDB connection)
   package.json
 
 admin-dashboard/
   src/
-    pages/          (Login, Overview, ParticipantTable, ParticipantHistory, Volunteers)
-    components/     (StatCard, Table, Timeline)
-    api/            (calls to backend)
+    pages/           (Login, Overview, ParticipantTable, VolunteerTable, History, ManageVolunteers)
+    components/       (StatCard, Table, Timeline)
+    api/              (calls to backend)
 
-volunteer-app/
-  src/
-    pages/          (Login, Registration, Food, NightEntry)
-    components/      (QRScanner, ParticipantCard, ActionButton)
-    api/
+volunteer-app-flutter/
+  lib/
+    screens/          (login_screen.dart, registration_screen.dart, food_screen.dart, night_entry_screen.dart)
+    widgets/           (qr_scanner.dart, person_card.dart, action_button.dart)
+    services/          (api_service.dart)
 ```
 
 ---
 
-## 16. Deployment Architecture (Putting It All Together)
+## 17. Deployment Architecture
 
 ```mermaid
 flowchart LR
     subgraph Internet
-        U1[Volunteer phones]
+        U1[8 Volunteer phones<br/>Flutter app]
         U2[Admin laptop]
+        CRON[Free external cron<br/>pings every 9 min]
     end
 
-    U1 -->|HTTPS| VApp[Volunteer App<br/>hosted on Vercel/Netlify]
-    U2 -->|HTTPS| AApp[Admin Dashboard<br/>hosted on Vercel/Netlify]
+    U1 -->|HTTPS| BE[Backend API<br/>Render free web service]
+    U2 -->|HTTPS| AApp[Admin Dashboard<br/>hosted on Render/Vercel/Netlify]
+    CRON -->|GET /health every 9 min| BE
 
-    VApp -->|API calls| BE[Backend API<br/>Supabase Edge Functions<br/>or Render free tier]
     AApp -->|API calls| BE
-    BE --> DB[(Supabase PostgreSQL)]
+    BE --> DB[(MongoDB Atlas M0)]
     DB -.->|realtime events| AApp
 ```
 
 ---
 
-## 17. Testing Strategy (Kept Realistic for a Student Team)
+## 18. Testing Strategy
 
-- **Before the event, with fake data:** create ~10 dummy participants, simulate the full journey (registration → kit → all meals → night entry) for each, and specifically try to double-scan the same action to confirm the duplicate-prevention actually blocks it.
-- **Load check:** even a rough manual test — have 5–6 phones scan in quick succession — is enough at this scale; you don't need a formal load-testing tool.
-- **Dry run night-before:** have real volunteers use the real app on real phones for a 15-minute rehearsal with a handful of test QR cards. This catches UI/scanning friction issues that are easy to miss testing alone.
-- **Have a manual fallback ready:** a simple paper backup sheet for each station, just in case the network goes down entirely during the event — the system should reduce manual work, not become a single point of failure for the whole event.
+- **Before the event, with fake data:** create ~10 dummy participants and 2–3 dummy volunteers, simulate the full journey for each, and specifically try to double-scan the same action to confirm the duplicate index actually blocks it.
+- **Test the participant/volunteer split explicitly:** try scanning a volunteer's QR on the Registration tab and confirm you get the "doesn't apply" error, not a crash.
+- **Test the 8-account limit:** try logging in with a volunteer account that has `app_access: false` and confirm it's rejected.
+- **Keep-alive check:** leave the backend idle for 20+ minutes and confirm the cron ping is actually preventing the sleep (check Render's logs).
+- **Dry run night-before:** real volunteers, real phones, real Flutter app, a handful of test QR badges for 15 minutes — this catches UI/scanning friction you won't find testing alone.
+- **Manual fallback ready:** a simple paper backup sheet per station in case the network goes down entirely during the event.
 
 ---
 
-## 18. One-Paragraph Summary
+## 19. One-Paragraph Summary
 
-Every participant gets one QR code containing a random token. Volunteers use a simple mobile web page to scan it, which asks the backend "who is this and what's their status?" — the backend is the only place that knows the rules (don't double-give lunch, don't give a kit before registration), and it records every single action as its own timestamped, volunteer-attributed row rather than just flipping a `true/false`. The admin dashboard reads from that same live data and updates automatically. At 120 participants and 30 volunteers, this whole system comfortably fits on free hosting tiers (Supabase + Vercel/Netlify), and the biggest risk to avoid is over-building — a native app, offline sync, and cryptographic QR signing are all unnecessary complexity for an event this size.
+Every participant and every one of the 8 app-enabled volunteers gets a QR code with a random token. The Flutter app scans it and asks the backend "who is this, and what's their status?" — the backend is the only place that knows the rules (registration is participant-only; food and night entry apply to both participants and volunteers; nothing can be recorded twice), and it stores every action as its own timestamped, volunteer-attributed MongoDB document rather than a simple true/false flag. The admin web dashboard reads that same live data and updates automatically, showing participants and volunteers as clearly separated but simultaneously visible counts. The whole system runs on MongoDB Atlas's free tier (which is drastically oversized for this data) and Render's free tier (kept awake by your 9-minute keep-alive ping), with zero App Store/Play Store overhead since the Flutter app only ever needs to reach 8 phones.
+# Event QR Participant & Volunteer Management System — Architecture Document
+
+**Scale target:** ~120 participants, volunteer team with **8 volunteers having scanning-app access**, single overnight hackathon event
+**Final stack:** MongoDB Atlas (database) + Render (backend hosting) + Flutter (volunteer scanning app) + Web admin dashboard
+
+> **Assumption used throughout this doc (please confirm):** Registration is for **participants only**. Food (breakfast/lunch/dinner) and Night Entry apply to **both participants and volunteers**, since volunteers are also fed and are also inside the venue overnight, and the admin needs a combined "has everyone eaten / has everyone entered" view. If this is wrong, say so and this gets a quick edit.
+
+---
+
+## 1. What We Are Actually Building (Plain Explanation)
+
+Three pieces of software, all talking to **one shared backend and one shared MongoDB database**:
+
+1. **Volunteer App (Flutter)** — a mobile app installed on the phones of the 8 volunteers who scan QR codes. Since it's only going to 8 known people, you don't need to publish it on the Play Store/App Store — build it, export the APK (Android) or an ad-hoc build (iOS), and share it directly (Drive link, WhatsApp, USB) with those 8 phones.
+2. **Admin Dashboard (Web)** — a website coordinators open on a laptop. Shows live counts for participants *and* volunteers, full tables, and full history per person.
+3. **Backend API + MongoDB** — the "brain." Every scan from every volunteer's Flutter app goes here. It decides if the action is allowed, records it, and pushes the update to the admin dashboard.
+
+**Why one shared backend matters:** no app "remembers" anything on its own — the phone is just a scanner + button. The backend is the single source of truth, so two volunteers can never accidentally give the same person lunch twice, and no one can be double-counted for night entry.
+
+---
+
+## 2. High-Level Architecture
+
+```mermaid
+flowchart TB
+    subgraph Clients
+        A[Admin Dashboard<br/>Web app, laptop]
+        V[Volunteer App<br/>Flutter, 8 phones only]
+    end
+
+    subgraph Backend
+        API[Backend API<br/>Node.js + Express]
+        AUTH[Auth + Role Check<br/>only 8 volunteer logins valid]
+        LOGIC[Business Rules<br/>duplicate checks, sequence checks]
+    end
+
+    DB[(MongoDB Atlas<br/>Participants, Volunteers, Actions)]
+    RT[Realtime Updates<br/>WebSocket / polling]
+
+    A -->|HTTPS requests| API
+    V -->|HTTPS requests| API
+    API --> AUTH --> LOGIC --> DB
+    DB -->|change events| RT
+    RT -->|live push| A
+```
+
+Both apps are "thin clients" — they show data and send requests. All real decision-making (is this allowed? has it already happened?) lives in the backend, never in the app itself.
+
+---
+
+## 3. What's On the QR Code
+
+**Rule: the QR code contains almost nothing** — just a random lookup key.
+
+```
+QR content  =  a random unique token string
+Example     =  "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f"
+```
+
+**Every person who can be scanned gets one token** — this now includes both participants (printed on their ID card) and volunteers (printed on their volunteer badge, since volunteers also get scanned for food and night entry).
+
+Flow every time a QR is scanned:
+
+```
+Scanned text (token)
+      ↓
+Sent to backend: POST /scan { token }
+      ↓
+Backend looks up the token in BOTH participants and volunteers
+      ↓
+Backend returns: who they are, what type (participant/volunteer), current status
+      ↓
+App displays the person + the relevant action buttons for that screen
+```
+
+At registration/onboarding time, generate this token once per person (a UUID), save it on their document, and print it as a QR on their card/badge. No signing or encryption needed at this scale — a long random UUID is already effectively unguessable.
+
+---
+
+## 4. Database Design (MongoDB — Collections, Not Tables)
+
+MongoDB is document-based, so instead of rigid tables we have **collections**. The same instinct from before still holds: **don't just store `lunch: true/false` on a person's document — store a log of timestamped, volunteer-attributed events**, and derive status from that log.
+
+### Collections
+
+```mermaid
+erDiagram
+    TEAMS ||--o{ PARTICIPANTS : has
+    PARTICIPANTS ||--o{ ACTIONS : "has history of"
+    VOLUNTEERS ||--o{ ACTIONS : "has history of (own food/entry)"
+    VOLUNTEERS ||--o{ ACTIONS : performs
+
+    TEAMS {
+        string team_id PK
+        string team_name
+    }
+
+    PARTICIPANTS {
+        string participant_id PK
+        string name
+        string college
+        string team_id FK
+        string qr_token UK
+        timestamp created_at
+    }
+
+    VOLUNTEERS {
+        string volunteer_id PK
+        string name
+        string username
+        string password_hash
+        string qr_token UK
+        boolean app_access
+        string assigned_station
+        timestamp created_at
+    }
+
+    ACTIONS {
+        string action_id PK
+        string subject_type
+        string subject_id
+        string action_type
+        string performed_by_volunteer_id FK
+        timestamp created_at
+    }
+```
+
+**`participants` collection** — one document per participant:
+```json
+{
+  "_id": "EVT-00125",
+  "name": "Rahul Kumar",
+  "college": "XYZ College",
+  "team_id": "TEAM-ALPHA",
+  "qr_token": "a91f3c9d-88e2-4a10-9b77-3c1e9a0e2d4f",
+  "created_at": "2026-09-18T06:00:00Z"
+}
+```
+
+**`volunteers` collection** — one document per volunteer. `app_access` marks exactly which volunteers can log into the Flutter app (your "only 8" rule) — this lets you add more volunteers to the system later (for meal tracking etc.) without automatically giving them scanner-app logins:
+```json
+{
+  "_id": "VOL-018",
+  "name": "Aisha Verma",
+  "username": "vol018",
+  "password_hash": "•••••",
+  "qr_token": "5e2a11f0-...",
+  "app_access": true,
+  "assigned_station": "food",
+  "created_at": "2026-09-18T06:00:00Z"
+}
+```
+
+**`actions` collection** — the single event log, shared by participants and volunteers, using `subject_type` to tell them apart:
+```json
+{
+  "_id": "ACT-004821",
+  "subject_type": "participant",
+  "subject_id": "EVT-00125",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:04:52Z"
+}
+```
+```json
+{
+  "_id": "ACT-004822",
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
+  "action_type": "LUNCH",
+  "performed_by_volunteer_id": "VOL-018",
+  "created_at": "2026-09-18T13:11:09Z"
+}
+```
+
+**`action_type` values, and who they apply to:**
+
+| action_type | Applies to |
+|---|---|
+| `ID_VERIFIED` | Participants only |
+| `REGISTRATION_COMPLETED` | Participants only |
+| `KIT_ISSUED` | Participants only |
+| `PAPER_SIGNED` | Participants only |
+| `BREAKFAST` / `LUNCH` / `DINNER` | Participants **and** volunteers |
+| `NIGHT_ENTRY` | Participants **and** volunteers |
+
+### The one critical rule that prevents duplicates (MongoDB version)
+
+```js
+db.actions.createIndex(
+  { subject_type: 1, subject_id: 1, action_type: 1 },
+  { unique: true }
+)
+```
+
+This tells MongoDB: *"this exact subject (participant OR volunteer) can never have two `LUNCH` rows."* If two volunteers scan the same person for lunch at the same moment, MongoDB accepts the first insert and rejects the second with an `E11000 duplicate key` error — your backend catches that specific error and turns it into a clean "Lunch already given" message. No manual locking code needed.
+
+A person's status (e.g. "Lunch: Given ✓") is simply: *does an action document exist for `(subject_type, subject_id, 'LUNCH')`?* You don't need a separate status field to keep in sync.
+
+---
+
+## 5. How Data Storage Size Actually Looks (MongoDB Atlas Free Tier)
+
+| Collection | Docs | Rough size each | Total |
+|---|---|---|---|
+| participants | 120 | ~0.5 KB | ~60 KB |
+| volunteers | ~10–30 | ~0.3 KB | ~10 KB |
+| teams | ~20 | ~0.2 KB | ~4 KB |
+| actions | up to (120+8) × ~7 actions ≈ 900 | ~0.3 KB | ~270 KB |
+
+**Total real data: well under 1 MB**, even generously padded for indexes it stays in the low single-digit MB. Your MongoDB Atlas **free M0 tier (512 MB)** is 100x+ more than you will ever need — it is not something to worry about for this event.
+
+---
+
+## 6. Volunteer App (Flutter) — Screens & Flow
+
+```mermaid
+flowchart TD
+    L[Login: Volunteer ID + PIN<br/>only 8 accounts are valid] --> N{Bottom Nav}
+    N --> R[Registration Tab]
+    N --> F[Food Tab]
+    N --> NE[Night Entry Tab]
+
+    R --> RS[Tap SCAN QR]
+    RS --> RC[Camera opens, scans QR]
+    RC --> RCheck{Token belongs to<br/>a participant?}
+    RCheck -- No, it's a volunteer --> RErr[Registration does not apply<br/>to volunteers — show message]
+    RCheck -- Yes --> RP[Participant card shown<br/>+ checklist]
+    RP --> RD[Volunteer taps DONE]
+    RD --> RB[Backend validates + saves]
+    RB --> RSucc[Success screen] --> RS
+
+    F --> FM{Pick meal}
+    FM --> B1[Breakfast]
+    FM --> L1[Lunch]
+    FM --> D1[Dinner]
+    B1 --> FS[SCAN QR]
+    L1 --> FS
+    D1 --> FS
+    FS --> FDetect{Participant or volunteer?}
+    FDetect --> FC[Person shown<br/>+ GIVE MEAL button]
+    FC --> FB[Backend validates + saves<br/>subject_type set automatically]
+    FB --> FSucc[Success] --> FS
+
+    NE --> NS[SCAN QR]
+    NS --> NDetect{Participant or volunteer?}
+    NDetect --> NC[Person shown<br/>+ ENTRY button]
+    NC --> NB[Backend validates + saves]
+    NB --> NSucc[Success] --> NS
+```
+
+Notice the Registration tab is the one exception that explicitly rejects volunteer QR codes — that's the one workflow that's participant-only per Section 4's table.
+
+**Login for the app:** since only 8 volunteers ever use it, keep this dead simple — a `volunteer_id` + PIN login screen, and the backend only issues a valid session if that volunteer's document has `app_access: true`.
+
+---
+
+## 7. Backend Flow — What Happens on Every Scan
+
+Same shape for every tab; only `action_type` and which collection is checked (`subject_type`) changes.
+
+```mermaid
+flowchart TD
+    S[App sends:<br/>token + action_type + volunteer_session] --> A{Is this one of the<br/>8 logged-in volunteers,<br/>authorized for this station?}
+    A -- No --> E1[403: Not authorized]
+    A -- Yes --> B{Does token match a<br/>participant OR a volunteer?}
+    B -- No --> E2[404: Not found]
+    B -- Yes --> C0{Is this action type<br/>allowed for this subject_type?<br/>e.g. REGISTRATION blocked for volunteers}
+    C0 -- No --> E5[400: This action doesn't apply here]
+    C0 -- Yes --> C{Does an action already exist for<br/>this subject_type + subject_id + action_type?}
+    C -- Yes --> E3[409: Already done — show who/when]
+    C -- No --> D{Are prerequisite steps done?<br/>e.g. registration before kit}
+    D -- No --> E4[400: Complete earlier step first]
+    D -- Yes --> F[INSERT new action document]
+    F --> G[Return success + updated status]
+    G --> H[Realtime event fires →<br/>admin dashboard updates live]
+```
+
+---
+
+## 8. Admin Dashboard — Screens & Flow
+
+```mermaid
+flowchart TD
+    AL[Admin Login] --> D[Dashboard Home]
+    D --> OV[Live Overview Cards<br/>Participants: Registered / Kits / Meals / Night Entry<br/>Volunteers: Meals / Night Entry]
+    D --> PT[Participant Table<br/>filter/search by team or status]
+    D --> VT[Volunteer Table<br/>meals + night entry status]
+    PT --> PP[Click a participant]
+    VT --> VP[Click a volunteer]
+    PP --> PH[Full History Timeline]
+    VP --> VH[Full History Timeline]
+    D --> VM[Manage Volunteers<br/>add/disable app_access for the 8 accounts]
+    D --> EX[Export CSV]
+    OV -.->|auto-updates live| RTX[Realtime channel]
+    PT -.->|auto-updates live| RTX
+    VT -.->|auto-updates live| RTX
+```
+
+**Combined "has everyone eaten" view:** the overview cards show participants and volunteers as two related-but-separate counts (e.g. "Lunch — Participants: 98/120, Volunteers: 7/8") so the admin can see the full picture without the two groups' numbers blending together confusingly.
+
+**How live-updating works:** the dashboard opens one persistent connection to the backend. Whenever any scan is saved, the backend pushes that one small update down the open connection and the dashboard re-renders just that part — no manual refresh needed.
+
+---
+
+## 9. Duplicate Prevention & Concurrency — Explained Simply
+
+**The scenario:** two volunteers scan the same person for lunch within the same second.
+
+**The wrong way:** check "already given?" then insert a moment later — there's a small gap where both requests can slip through (a "race condition").
+
+**The right way:** let MongoDB's unique index (Section 4) be the single source of truth. Both requests try to insert. MongoDB physically allows only one document for `(subject_type, subject_id, action_type)`. The first insert succeeds; the second is rejected by the database itself, and the backend turns that rejection into a clean "already given" message. No custom locking code required.
+
+---
+
+## 10. Roles & Permissions
+
+| Action | Admin | Volunteer (1 of the 8) |
+|---|---|---|
+| Scan & record actions | ✅ (all types) | ✅ (only for their assigned tab/station) |
+| View all participants/volunteers | ✅ | ❌ (only the one they just scanned) |
+| View full activity log / audit trail | ✅ | ❌ |
+| Add/disable volunteer app access | ✅ | ❌ |
+| Override a duplicate action (fix a mistake) | ✅ | ❌ |
+| Edit participant/volunteer details | ✅ | ❌ |
+| Delete any record | ❌ (avoid entirely — see Section 15) | ❌ |
+| Export data | ✅ | ❌ |
+
+A volunteer's login session carries `role: volunteer`, `volunteer_id`, and `station`. The backend checks this on **every** request — never trust the app screen alone, since a screen can be tampered with but a backend check cannot.
+
+---
+
+## 11. API Endpoints
+
+```
+POST   /auth/login                    → returns a session token (admin or one of the 8 volunteers)
+POST   /scan                          → { token } → returns subject_type + person info + current status
+POST   /actions                       → { subject_type, subject_id, action_type } → records one action
+GET    /participants                  → admin only, full table
+GET    /volunteers                    → admin only, full table
+GET    /participants/:id/history      → full timeline for one participant
+GET    /volunteers/:id/history        → full timeline for one volunteer
+GET    /dashboard/summary             → live counts (participants + volunteers, separated)
+POST   /volunteers                    → admin only, create a volunteer (app_access true/false)
+```
+
+**Example: recording a volunteer's own lunch**
+
+Request:
+```json
+POST /actions
+{
+  "subject_type": "volunteer",
+  "subject_id": "VOL-022",
+  "action_type": "LUNCH"
+}
+```
+(the scanning volunteer's own identity comes from their login session, not the request body)
+
+Success response:
+```json
+{
+  "status": "success",
+  "subject_type": "volunteer",
+  "action_type": "LUNCH",
+  "recorded_at": "2026-09-18T13:11:09Z",
+  "performed_by": "VOL-018"
+}
+```
+
+Duplicate response:
+```json
+{
+  "status": "error",
+  "code": "ALREADY_DONE",
+  "message": "Lunch has already been given.",
+  "given_at": "2026-09-18T13:11:09Z",
+  "given_by": "VOL-018"
+}
+```
+
+Wrong-action-type response (e.g. trying REGISTRATION on a volunteer):
+```json
+{
+  "status": "error",
+  "code": "ACTION_NOT_APPLICABLE",
+  "message": "Registration does not apply to volunteers."
+}
+```
+
+---
+
+## 12. Final Tech Stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| Volunteer app | **Flutter** (Android build shared as an APK directly to the 8 phones) | You've chosen this — since distribution is to only 8 known people, you can skip the Play Store entirely and just share the APK file |
+| Admin dashboard | React (or plain HTML/JS) | Small dataset, no need for anything heavy |
+| Backend | **Node.js + Express** (Mongoose for MongoDB) — FastAPI + PyMongo/Motor is an equally fine alternative if your team knows Python better | Simple REST API, pairs cleanly with MongoDB |
+| Database | **MongoDB Atlas (M0 free tier)** | Finalized — see Section 5 for why 512 MB is plenty |
+| Auth | Username+PIN with hashed passwords (bcrypt) and session tokens (JWT) | No need for anything more elaborate at this scale |
+| Realtime updates | WebSocket (Socket.IO) for the admin dashboard, or polling every 5–10s as a simpler fallback | Either is fine at this scale |
+
+---
+
+## 13. Hosting: Render + Your Keep-Alive Script
+
+**Finalized choice: Render free web service** for the backend.
+
+Render's free tier sleeps a service after **15 minutes** of no incoming traffic, and the first request after sleeping takes 30–60 seconds to wake up. Your plan — a script that pings the backend's URL every **9 minutes** — is the right fix, and 9 minutes is safely under the 15-minute threshold with margin for network delays.
+
+**How to build the keep-alive script (two options):**
+- **Simple/free and reliable:** use a free external cron service like [cron-job.org](https://cron-job.org) or UptimeRobot to hit a lightweight `GET /health` endpoint on your backend every 9 minutes. This is more reliable than self-pinging because it runs outside Render, so it isn't affected by your own service sleeping.
+- **Self-pinging (inside your own backend):** a `setInterval` or `node-cron` job inside the Express app that calls its own `/health` route every 9 minutes. Simpler to set up, but has a chicken-and-egg risk if the service ever cold-starts from something outside your control (a deploy, a crash) — the external cron option avoids that.
+
+**One number worth knowing:** Render's free tier gives **750 instance-hours/month**, and a 31-day month has 744 hours. Keeping the service awake 24/7 all month fits *just* inside that limit — but it's tight. If you only need it awake during your active dev/testing days and the event itself (not the full month), turn the keep-alive off outside those windows so you have hours to spare rather than running right at the edge.
+
+Add a simple `/health` endpoint that just returns `{ status: "ok" }` — this is what the keep-alive pings hit, and it avoids putting load on your real database-touching endpoints just to stay awake.
+
+---
+
+## 14. MVP vs. Later vs. Skip Entirely
+
+| Feature | MVP (build first) | Add if time allows | Skip — unnecessary here |
+|---|---|---|---|
+| QR scan + participant/volunteer lookup | ✅ | | |
+| Registration checklist (participants only) + backend validation | ✅ | | |
+| Food (breakfast/lunch/dinner) for participants **and** volunteers, duplicate-proof | ✅ | | |
+| Night entry for participants **and** volunteers | ✅ | | |
+| Admin overview counts, split by participant/volunteer | ✅ | | |
+| Admin tables + individual history | ✅ | | |
+| Role-based login (admin vs. 8 volunteer accounts) | ✅ | | |
+| Render keep-alive script | ✅ | | |
+| Live-updating dashboard (realtime push) | | ✅ (5–10s polling is a fine MVP substitute) | |
+| CSV export | | ✅ | |
+| Admin "override" for correcting mistaken duplicates | | ✅ | |
+| Offline mode with later sync | | | ❌ — adds real complexity for a single-venue event |
+| QR signing / cryptographic verification | | | ❌ — random UUID token is sufficient here |
+| Publishing the Flutter app to Play Store | | | ❌ — unnecessary for 8 known phones, just share the APK |
+| Microservices | | | ❌ — one backend service is all you need |
+
+---
+
+## 15. Edge Cases Worth Planning For
+
+- **Volunteer needs to undo a mistaken scan:** don't allow `DELETE` on action documents even for admins — add an `is_voided` flag instead, so the audit trail is never erased, only marked invalid.
+- **QR code damaged/unreadable:** give volunteers a manual fallback — a search-by-name/ID box in the app for when a card won't scan.
+- **Volunteer's own badge is lost:** admin should be able to look up that volunteer and reissue their existing token (don't generate a new one, or their history splits across two tokens).
+- **A volunteer without `app_access` accidentally tries to log in:** backend should reject clearly ("this account does not have scanner access") rather than silently failing.
+- **Phone loses signal mid-event:** show a clear "connection lost, please retry" message — never let the app pretend an action succeeded when it didn't reach the backend.
+- **Registration accidentally attempted on a volunteer's badge:** backend rejects it with the `ACTION_NOT_APPLICABLE` response from Section 11 — this needs to be one of your very first tests.
+- **Render cold start right as the event starts:** send a manual warm-up ping ~10 minutes before doors open, even with the 9-minute keep-alive running, as a safety margin.
+
+---
+
+## 16. Suggested Folder Structure
+
+```
+backend/
+  src/
+    routes/         (auth.js, scan.js, actions.js, dashboard.js, volunteers.js, health.js)
+    controllers/     (business logic for each route)
+    middleware/      (auth check, role check, subject-type/action-type validity check)
+    models/          (Mongoose schemas: Participant, Volunteer, Action, Team)
+    db/              (MongoDB connection)
+  package.json
+
+admin-dashboard/
+  src/
+    pages/           (Login, Overview, ParticipantTable, VolunteerTable, History, ManageVolunteers)
+    components/       (StatCard, Table, Timeline)
+    api/              (calls to backend)
+
+volunteer-app-flutter/
+  lib/
+    screens/          (login_screen.dart, registration_screen.dart, food_screen.dart, night_entry_screen.dart)
+    widgets/           (qr_scanner.dart, person_card.dart, action_button.dart)
+    services/          (api_service.dart)
+```
+
+---
+
+## 17. Deployment Architecture
+
+```mermaid
+flowchart LR
+    subgraph Internet
+        U1[8 Volunteer phones<br/>Flutter app]
+        U2[Admin laptop]
+        CRON[Free external cron<br/>pings every 9 min]
+    end
+
+    U1 -->|HTTPS| BE[Backend API<br/>Render free web service]
+    U2 -->|HTTPS| AApp[Admin Dashboard<br/>hosted on Render/Vercel/Netlify]
+    CRON -->|GET /health every 9 min| BE
+
+    AApp -->|API calls| BE
+    BE --> DB[(MongoDB Atlas M0)]
+    DB -.->|realtime events| AApp
+```
+
+---
+
+## 18. Testing Strategy
+
+- **Before the event, with fake data:** create ~10 dummy participants and 2–3 dummy volunteers, simulate the full journey for each, and specifically try to double-scan the same action to confirm the duplicate index actually blocks it.
+- **Test the participant/volunteer split explicitly:** try scanning a volunteer's QR on the Registration tab and confirm you get the "doesn't apply" error, not a crash.
+- **Test the 8-account limit:** try logging in with a volunteer account that has `app_access: false` and confirm it's rejected.
+- **Keep-alive check:** leave the backend idle for 20+ minutes and confirm the cron ping is actually preventing the sleep (check Render's logs).
+- **Dry run night-before:** real volunteers, real phones, real Flutter app, a handful of test QR badges for 15 minutes — this catches UI/scanning friction you won't find testing alone.
+- **Manual fallback ready:** a simple paper backup sheet per station in case the network goes down entirely during the event.
+
+---
+
+## 19. One-Paragraph Summary
+
+Every participant and every one of the 8 app-enabled volunteers gets a QR code with a random token. The Flutter app scans it and asks the backend "who is this, and what's their status?" — the backend is the only place that knows the rules (registration is participant-only; food and night entry apply to both participants and volunteers; nothing can be recorded twice), and it stores every action as its own timestamped, volunteer-attributed MongoDB document rather than a simple true/false flag. The admin web dashboard reads that same live data and updates automatically, showing participants and volunteers as clearly separated but simultaneously visible counts. The whole system runs on MongoDB Atlas's free tier (which is drastically oversized for this data) and Render's free tier (kept awake by your 9-minute keep-alive ping), with zero App Store/Play Store overhead since the Flutter app only ever needs to reach 8 phones.
